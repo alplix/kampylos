@@ -12,6 +12,13 @@
 #include "lightcurve.h"
 #include "../vendor/VBMicrolensing/VBMicrolensing/lib/VBMicrolensingLibrary.h"
 
+// M_PI is a common extension (glibc, etc.), not standard C++ -- MSVC/mingw only define it
+// when _USE_MATH_DEFINES is set before <cmath> is first included, which isn't guaranteed given
+// the include order here. Defining it directly, guarded, works on every platform regardless.
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
 struct BinaryFitResult {
     double log_s, log_q, t0, u0, tE, alpha, rho;
     double fs, fb, chi2;
