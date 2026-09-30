@@ -1,0 +1,3 @@
+[submodule "vendor/VBMicrolensing"]
+	path = vendor/VBMicrolensing
+	url = https://github.com/valboz/VBMicrolensing.git
