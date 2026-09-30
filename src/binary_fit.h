@@ -7,6 +7,7 @@
 // smooth in those two dimensions the way it is in the other five.
 #include <vector>
 #include <cmath>
+#include <algorithm>
 #include "simplex.h"
 #include "lightcurve.h"
 #include "../vendor/VBMicrolensing/VBMicrolensing/lib/VBMicrolensingLibrary.h"
@@ -18,12 +19,14 @@ struct BinaryFitResult {
 
 // One local optimization run from one starting point. pr[] order matches VBMicrolensing's
 // BinaryLightCurve convention: [log(s), log(q), u0, alpha, log(rho), log(tE), t0].
+// n_restarts controls how many restart-from-converged passes follow the initial simplex run
+// (see the comment below) -- 0 for a cheap coarse screen, 2 for a full refine.
 inline BinaryFitResult fit_binary_local(
     VBMicrolensing& vbm,
     const std::vector<DataPoint>& data,
     double log_s, double log_q,
     double t0_seed, double u0_seed, double tE_seed, double alpha_seed, double rho_seed,
-    int max_iter = 400
+    int max_iter = 400, int n_restarts = 2
 ) {
     std::vector<double> mag(data.size());
 
@@ -51,7 +54,7 @@ inline BinaryFitResult fit_binary_local(
     // real structure on scales smaller than the initial step size. Restarting once from the
     // converged point with fresh (smaller) steps costs little and reliably breaks out of that
     // kind of premature convergence without needing a different algorithm.
-    for (int restart = 0; restart < 2; restart++) {
+    for (int restart = 0; restart < n_restarts; restart++) {
         std::vector<double> step2 = { 0.3, 0.02, 0.08, 0.15, 0.2 };
         SimplexResult res2 = nelder_mead(objective, res.x, step2, max_iter, 1e-10, 1e-9);
         if (res2.fval < res.fval) res = res2; else break;
@@ -70,10 +73,24 @@ inline BinaryFitResult fit_binary_local(
     return out;
 }
 
-// Multi-start version: tries several alpha seeds (the trajectory angle isn't determined by a
-// single-lens pre-fit at all, so a single starting guess would badly under-explore it) and
-// keeps the best. u0's sign is also ambiguous from a single-lens pre-fit (a binary lens isn't
-// symmetric under u0 -> -u0 the way a single lens is), so both signs are tried too.
+// Multistart: tries every combination of alpha seed x u0 sign x u0 magnitude x rho seed, each
+// with the FULL restart-backed local optimization (fit_binary_local's default n_restarts=2).
+//
+// A cheap-screen-then-refine version was tried first (rank all seeds with a short, no-restart
+// run, only fully refine the best few) to cut cost -- it was faster but unreliable: on this
+// same caustic-crossing test case it landed on chi2=523 instead of the true 386, because a
+// short run isn't long enough to tell a real basin from a false one near a caustic (the same
+// reason fit_binary_local itself needs restarts to escape premature convergence in the first
+// place). So this stays brute-force: every seed gets the full treatment, nothing is filtered
+// out based on an unreliable cheap proxy. Slower, but every seed that finds the true minimum
+// keeps it, rather than being screened away before it gets the chance to.
+//
+// u0's magnitude is seeded from multiple scales, not just the single-lens (PSPL) pre-fit's own
+// estimate: PSPL fits to a genuinely binary, caustic-crossing light curve are known to often
+// lock onto the wrong impact-parameter scale entirely, so trusting that one value as the only
+// u0 seed silently loses the true solution whenever that happens (this is exactly what caused
+// the very first version of this function to miss the true minimum when anchored from a real
+// automated PSPL pre-fit instead of a hand-picked good guess).
 inline BinaryFitResult fit_binary_multistart(
     VBMicrolensing& vbm,
     const std::vector<DataPoint>& data,
@@ -82,23 +99,22 @@ inline BinaryFitResult fit_binary_multistart(
     double rho_seed = 1e-3,
     int n_alpha_seeds = 8
 ) {
+    const double rho_seeds[] = { rho_seed, 1e-4, 1e-2 };
+    const double u0_mag_seeds[] = { fabs(u0_anchor), 0.02 };
+
     BinaryFitResult best;
     best.chi2 = 1e300;
-    // rho isn't just another free parameter to seed once and forget: near a caustic, the
-    // finite-source size controls how sharply magnification spikes, and starting far from the
-    // true value can land the optimizer in a smoothed-out local optimum it can't climb out of.
-    // A handful of rho seeds spanning the range real events actually show costs little next to
-    // the alpha/u0-sign search that's already happening.
-    const double rho_seeds[] = { rho_seed, 1e-4, 1e-3, 1e-2 };
     for (int i = 0; i < n_alpha_seeds; i++) {
         double alpha_seed = 2.0 * M_PI * i / n_alpha_seeds;
-        for (double u0_sign : { 1.0, -1.0 }) {
-            for (double rs : rho_seeds) {
-                BinaryFitResult r = fit_binary_local(
-                    vbm, data, log_s, log_q,
-                    t0_anchor, u0_sign * fabs(u0_anchor), tE_anchor, alpha_seed, rs
-                );
-                if (r.chi2 < best.chi2) best = r;
+        for (double u0_mag : u0_mag_seeds) {
+            for (double u0_sign : { 1.0, -1.0 }) {
+                for (double rs : rho_seeds) {
+                    BinaryFitResult r = fit_binary_local(
+                        vbm, data, log_s, log_q,
+                        t0_anchor, u0_sign * u0_mag, tE_anchor, alpha_seed, rs
+                    );
+                    if (r.chi2 < best.chi2) best = r;
+                }
             }
         }
     }
