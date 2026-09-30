@@ -25,7 +25,7 @@ Early stage: archival photometry is being collected and the core binary-lens sol
 
 ## Output
 
-Results (grid search χ² maps per event) will be published openly — a raw dataset on Zenodo (DOI-backed, no academic affiliation required) and, for anything scientifically notable, a short write-up submitted to [Research Notes of the AAS](https://journals.aas.org/research-notes/) (free, no peer review, no affiliation required, indexed in ADS).
+Results (grid search χ² maps per event) will be published openly on Zenodo, with anything scientifically notable submitted to [Research Notes of the AAS](https://journals.aas.org/research-notes/).
 
 ## Acknowledgments
 
