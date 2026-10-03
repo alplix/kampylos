@@ -60,8 +60,15 @@ int main() {
         cpu_r.chi2, cpu_r.t0, cpu_r.u0, cpu_r.tE, cpu_r.alpha, cpu_r.rho, cpu_r.fs, cpu_r.fb, (long long)cpu_ms);
 
     printf("\n--- GPU batched (gpu_fit_binary_multistart) ---\n");
+    GpuFitContext ctx;
+    std::string dev_err;
+    if (!GpuFitContext::select_device(0, &dev_err)) {
+        fprintf(stderr, "cudaSetDevice(0) failed: %s\n", dev_err.c_str());
+        return 1;
+    }
+    gpu_upload_light_curve(ctx, data);
     auto gpu_start = std::chrono::steady_clock::now();
-    BinaryFitResult gpu_r = gpu_fit_binary_multistart(vbm, data, true_log_s, true_log_q, t0_anchor, u0_anchor, tE_anchor);
+    BinaryFitResult gpu_r = gpu_fit_binary_multistart(ctx, vbm, data, true_log_s, true_log_q, t0_anchor, u0_anchor, tE_anchor);
     auto gpu_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - gpu_start).count();
     printf("chi2=%.4f t0=%.4f u0=%.5f tE=%.4f alpha=%.4f rho=%.6f fs=%.4f fb=%.4f  (%lld ms)\n",
         gpu_r.chi2, gpu_r.t0, gpu_r.u0, gpu_r.tE, gpu_r.alpha, gpu_r.rho, gpu_r.fs, gpu_r.fb, (long long)gpu_ms);

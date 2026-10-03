@@ -8,6 +8,7 @@
 // just by evaluating many candidates per step instead of one.
 #include <cuda_runtime.h>
 #include <vector>
+#include <string>
 #include <cstdio>
 #include <cstdlib>
 #include "kampylos_gpu_mag.cuh"
@@ -15,7 +16,7 @@
 #include "kampylos_gpu_kernel.cu"
 #include "kampylos_gpu_complete.h"
 #include "nelder_mead_stepper.h"
-#include "binary_fit.h" // BinaryFitResult
+#include "gpu_fit_binary.h" // GpuFitContext, BinaryFitResult, function declarations
 
 #define CUDA_CHECK_RT(call) do { \
     cudaError_t _e = (call); \
@@ -24,45 +25,6 @@
         exit(1); \
     } \
 } while (0)
-
-// Persistent device buffers for one grid cell's worth of GPU-accelerated fitting -- the light
-// curve itself is uploaded once per cell (fixed across every seed and restart), candidate/result
-// buffers are sized for the worst case one round can need (every one of up to
-// GPU_FIT_MAX_PARALLEL_SEEDS active searches simultaneously in its shrink phase, 5 points each)
-// and reused round to round rather than realloc'd.
-struct GpuFitContext {
-    LightCurvePoint* d_data = nullptr;
-    int n_points = 0;
-    int data_capacity = 0;
-    Candidate* d_cand = nullptr;
-    CandidateResult* d_res = nullptr;
-    int cand_capacity = 0;
-
-    void ensure_data_capacity(int n) {
-        if (n <= data_capacity) return;
-        if (d_data) cudaFree(d_data);
-        CUDA_CHECK_RT(cudaMalloc(&d_data, n * sizeof(LightCurvePoint)));
-        data_capacity = n;
-    }
-    void ensure_cand_capacity(int n) {
-        if (n <= cand_capacity) return;
-        if (d_cand) cudaFree(d_cand);
-        if (d_res) cudaFree(d_res);
-        CUDA_CHECK_RT(cudaMalloc(&d_cand, n * sizeof(Candidate)));
-        CUDA_CHECK_RT(cudaMalloc(&d_res, n * sizeof(CandidateResult)));
-        cand_capacity = n;
-    }
-    void upload_light_curve(const std::vector<LightCurvePoint>& data) {
-        ensure_data_capacity((int)data.size());
-        n_points = (int)data.size();
-        CUDA_CHECK_RT(cudaMemcpy(d_data, data.data(), n_points * sizeof(LightCurvePoint), cudaMemcpyHostToDevice));
-    }
-    ~GpuFitContext() {
-        if (d_data) cudaFree(d_data);
-        if (d_cand) cudaFree(d_cand);
-        if (d_res) cudaFree(d_res);
-    }
-};
 
 // One batched evaluation round: uploads `points` as candidates (all at the fixed log_s/log_q for
 // this cell), launches the kernel, completes each result on the CPU (patching in any bad points),
@@ -158,23 +120,37 @@ static std::vector<SimplexResultLite> gpu_batched_nelder_mead(
     return out;
 }
 
+// Converts the DataPoint vector (Kampylos's own lightcurve.h type) to this file's
+// LightCurvePoint (kampylos_gpu_types.h) and uploads it -- call once per WU (the light curve is
+// the same across every grid cell a WU processes), not once per cell, since it can be thousands
+// of points and re-uploading it n_q times per WU for no reason is pure waste.
+void gpu_upload_light_curve(GpuFitContext& ctx, const std::vector<DataPoint>& data) {
+    std::vector<LightCurvePoint> h_data(data.size());
+    for (size_t i = 0; i < data.size(); i++) h_data[i] = { data[i].t, data[i].flux, data[i].sigma };
+    ctx.upload_light_curve(h_data);
+}
+
 // GPU-accelerated equivalent of binary_fit.h's fit_binary_multistart(): same seed grid (8 alpha x
 // 2 u0 magnitudes x 2 signs x 3 rho seeds = 96 searches), same restart-from-converged refinement
 // pass (n_restarts default 2) -- every one of those 96 (and then their restarts) runs as one
 // batched GPU pass instead of 96 sequential CPU calls.
+//
+// Takes an already-initialized GpuFitContext (device already selected via cudaSetDevice, light
+// curve already uploaded via gpu_upload_light_curve) rather than owning one itself -- a WU calls
+// this once per grid cell (n_q times), and the context's device buffers/light curve upload should
+// persist across those calls, not be torn down and rebuilt every cell.
 BinaryFitResult gpu_fit_binary_multistart(
+    GpuFitContext& ctx,
     VBMicrolensing& vbm,
     const std::vector<DataPoint>& data,
     double log_s, double log_q,
     double t0_anchor, double u0_anchor, double tE_anchor,
-    double rho_seed = 1e-3,
-    int n_alpha_seeds = 8,
-    int n_restarts = 2
+    double rho_seed,
+    int n_alpha_seeds,
+    int n_restarts
 ) {
-    GpuFitContext ctx;
     std::vector<LightCurvePoint> h_data(data.size());
     for (size_t i = 0; i < data.size(); i++) h_data[i] = { data[i].t, data[i].flux, data[i].sigma };
-    ctx.upload_light_curve(h_data);
     double s = exp(log_s), q = exp(log_q);
 
     const double rho_seeds[] = { rho_seed, 1e-4, 1e-2 };
