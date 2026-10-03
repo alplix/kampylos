@@ -6,6 +6,7 @@
 // same plain compiler as the rest of Kampylos's CPU code (this is meant to end up called from
 // main_kampylos_boinc.cpp's eventual GPU-enabled build, not just this header's own test).
 #include <cmath>
+#include <algorithm>
 #include "kampylos_gpu_types.h"
 #include "VBMicrolensingLibrary.h"
 
@@ -62,20 +63,34 @@ inline CompletedFit kampylos_complete_candidate(
 
     // Same ridge regularization as lightcurve.h's linear_flux_fit() -- this is a SEPARATE
     // reimplementation of the same closed-form fs/fb solve (needed here since the GPU's partial
-    // sums arrive already split from the CPU-patched bad-point sums, not through that function),
-    // so it needs the identical fix: an absolute 1e-300 degeneracy threshold never trips in
-    // practice, letting a near-singular design (the model magnification barely varying across the
-    // light curve -- common when a candidate's trial parameters are far from the real event)
-    // through to a raw Cramer's-rule divide that blows fs/fb up to huge, meaningless values. See
-    // lightcurve.h for the full analysis (confirmed directly: this exact gap caused the GPU
-    // backends to report wildly wrong fs/fb -- e.g. in the hundreds of thousands -- for harder
-    // light curves where the CPU reference, going through the already-fixed linear_flux_fit(),
-    // got the correct answer on the identical candidate).
-    double lambda = 1e-3 * S_11;
-    double S_AA_r = S_AA + lambda, S_11_r = S_11 + lambda;
+    // sums arrive already split from the CPU-patched bad-point sums, not through that function).
+    // Each diagonal entry is damped relative to ITS OWN magnitude (not a shared lambda tied only
+    // to S_11), since S_AA scales like A^2 while S_11 doesn't scale with A at all -- a shared,
+    // S_11-only lambda is negligible next to S_AA for a high-magnification trial (common right
+    // near a caustic) and leaves that entry effectively unregularized. See lightcurve.h for the
+    // full analysis (confirmed directly: even the first, S_11-only version of this fix still let
+    // the GPU backend report fs/fb in the hundreds of thousands for exactly this kind of trial).
+    double eps_reg = 1e-2;
+    double S_AA_r = S_AA * (1.0 + eps_reg), S_11_r = S_11 * (1.0 + eps_reg);
     double det = S_AA_r * S_11_r - S_A1 * S_A1;
     double fs = (S_11_r * S_Ay - S_A1 * S_1y) / det;
     double fb = (S_AA_r * S_1y - S_A1 * S_Ay) / det;
+    // Same second line of defense as lightcurve.h's linear_flux_fit(): proportional
+    // regularization alone isn't a complete fix (in the exactly-constant-A limit, the eps term
+    // cancels out of fs/fb algebraically, leaving a value set by data noise alone -- confirmed
+    // directly, a trial with tE far beyond the data span still produced fs/fb in the tens of
+    // thousands even with the regularization above in place). A real fit's fs/fb are flux
+    // contributions in the same units as the data, so they can't legitimately run far past the
+    // data's own scale. No per-point flux array here (this function only ever sees the kernel's
+    // running sums plus the few patched bad points), so the scale is estimated from the sums
+    // already at hand: sqrt(S_yy/S_11) is the weighted RMS flux, cheap and good enough as an
+    // order-of-magnitude bound without a second pass over the light curve.
+    double flux_scale = std::sqrt(std::max(S_yy / std::max(S_11, 1e-300), 1e-300));
+    double fs_bound = 1e3 * std::max(flux_scale, 1e-12);
+    if (std::fabs(fs) > fs_bound || std::fabs(fb) > fs_bound) {
+        fs = 0;
+        fb = S_11 > 0 ? S_1y / S_11 : 0;
+    }
     // chi2 = S_yy - fs*S_Ay - fb*S_1y (see kampylos_gpu_kernel.cu's top comment for the identity).
     out.chi2 = S_yy - fs * S_Ay - fb * S_1y;
     out.fs = fs;

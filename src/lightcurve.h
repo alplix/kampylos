@@ -90,16 +90,46 @@ inline FluxFit linear_flux_fit(const std::vector<DataPoint>& data, const std::ve
     // fs/fb continuously as the design approaches singularity -- there is no longer a boundary
     // where chi2 keeps improving right up to a jump, because the ridge term costs a little more
     // bias the closer the fit leans on an ill-constrained direction, smoothly outweighing
-    // whatever spurious chi2 "gain" a near-singular design offered. lambda is tied to S_11 (the
-    // sum of weights -- the problem's natural scale) rather than an absolute value, and is small
-    // enough (1e-3) to leave any well-conditioned fit (real signal, S_A1^2 well below S_AA*S_11)
-    // essentially unaffected.
-    double lambda = 1e-3 * S_11;
-    double S_AA_r = S_AA + lambda, S_11_r = S_11 + lambda;
+    // whatever spurious chi2 "gain" a near-singular design offered.
+    //
+    // A first version added the same lambda (tied only to S_11) to both diagonal entries. That
+    // works fine when the model magnification A is O(1), but S_AA scales like A^2 while S_11
+    // doesn't scale with A at all -- for a high-magnification trial (common right near a
+    // caustic), S_AA can be orders of magnitude above S_11, making an S_11-only lambda negligible
+    // next to S_AA and leaving that entry essentially unregularized. Confirmed directly: the GPU
+    // backend still reported fs/fb in the hundreds of thousands for exactly this kind of trial
+    // even with that fix in place. Each diagonal entry now gets damped relative to ITS OWN
+    // magnitude instead (equivalent to scaling both by a constant factor near 1), so the
+    // regularization strength tracks whichever term actually needs it regardless of A's scale.
+    double eps_reg = 1e-2;
+    double S_AA_r = S_AA * (1.0 + eps_reg), S_11_r = S_11 * (1.0 + eps_reg);
     double det = S_AA_r * S_11_r - S_A1 * S_A1;
     FluxFit out;
     out.fs = (S_11_r * S_Ay - S_A1 * S_1y) / det;
     out.fb = (S_AA_r * S_1y - S_A1 * S_Ay) / det;
+    // Proportional regularization alone turned out not to be a complete fix either: worked out
+    // on paper, in the EXACTLY-constant-A limit the eps term algebraically cancels out of fs/fb
+    // entirely, leaving a finite but data-noise-dominated value -- and confirmed directly, a
+    // trial far enough out (tE far beyond the data span, magnification nearly constant to within
+    // floating-point noise) still produced fs/fb in the tens of thousands. Since no amount of
+    // continuous regularization removes every pathological corner (the near-constant-A case is a
+    // genuine, not just numerical, degeneracy -- fs/fb truly are unconstrained there), this adds
+    // a second, independent line of defense: a sanity bound on the SOLVED fs/fb against the
+    // data's own flux scale. A real fit's fs/fb are flux contributions in the same units as the
+    // data, so they cannot legitimately run to 1000x the observed spread. This is a backstop, not
+    // the primary defense -- the regularization above already removes most of the incentive to
+    // approach this corner, so this should rarely trigger for a genuine fit, only for the
+    // remaining pathological trials that still find their way to it.
+    double flux_lo = data[0].flux, flux_hi = data[0].flux;
+    for (size_t i = 0; i < n; i++) {
+        flux_lo = std::min(flux_lo, data[i].flux);
+        flux_hi = std::max(flux_hi, data[i].flux);
+    }
+    double fs_bound = 1e3 * std::max(flux_hi - flux_lo, 1e-12);
+    if (std::fabs(out.fs) > fs_bound || std::fabs(out.fb) > fs_bound) {
+        out.fs = 0;
+        out.fb = S_11 > 0 ? S_1y / S_11 : 0;
+    }
     double chi2 = 0;
     for (size_t i = 0; i < n; i++) {
         double w = 1.0 / (data[i].sigma * data[i].sigma);
