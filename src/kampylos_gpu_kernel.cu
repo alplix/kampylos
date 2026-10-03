@@ -5,79 +5,52 @@
 // themselves (this is where the real parallelism is: a light curve can have anywhere from
 // hundreds to tens of thousands of points, see kampylos's three survey sources).
 //
-// Correctness strategy (the part that matters most here -- see kampylos_gpu_mag.cuh's own
-// top comment for why): this kernel ONLY ever uses the point-source + quadrupole/hexadecapole
-// fast path (binary_mag0_gpu / binary_mag2_fastpath_ok). It does NOT attempt finite-source
-// contour integration (BinaryMagDark) on the GPU -- that stays on the CPU, in the real,
-// already-correct VBMicrolensing library. Instead, this kernel also reports, per candidate,
-// whether ANY of its data points failed the fast-path accept/reject test (output.needs_fallback).
-// The caller's job (not this file's) is: for any candidate with needs_fallback set, discard this
-// kernel's chi2 for that one candidate and recompute it on the CPU via the real
-// fit_binary_local()-style objective function instead -- the GPU's result for that candidate was
-// never meant to be trusted, only its SIGNAL that CPU-exact evaluation is needed here. This
-// keeps every number that's actually used either genuinely GPU-fast-and-correct, or genuinely
-// CPU-exact -- never a silent approximation presented as a real result, which is what would make
-// this scientifically unusable.
+// Correctness strategy (the part that matters most here -- see kampylos_gpu_mag.cuh's own top
+// comment for why): this kernel ONLY ever uses the point-source + quadrupole/hexadecapole fast
+// path (binary_mag0_gpu / binary_mag2_fastpath_ok). It never attempts finite-source contour
+// integration (BinaryMagDark) itself -- that stays on the CPU, in the real, already-correct
+// VBMicrolensing library, for just the handful of points that actually need it.
 //
-// KNOWN LIMITATION (found via tests/test_kampylos_gpu_kernel.cu against a realistic synthetic
-// light curve, 2026-10-03): needs_fallback is a single bit per candidate -- ANY failing point
-// discards the WHOLE candidate's chi2 for CPU recomputation over ALL of its points. Tested
-// against a light curve with a real event (tens of near-peak points out of ~1700 total), nearly
-// every candidate near the true parameters had at least one near-peak point fail the fast-path
-// test, so nearly every candidate fell back to a full CPU recompute -- which defeats most of the
-// GPU speedup this kernel exists for, since the expensive part (an O(n_points) CPU loop) ends up
-// running for most candidates anyway, not as the rare exception the original design assumed.
-// Correct, but not yet the performant version. The real fix: have this kernel emit a compact
-// per-candidate LIST of which point indices failed (not just a bool), so the caller's CPU
-// fallback only recomputes those specific few points via BinaryMagDark and adds their
-// contribution to the chi2 this kernel already computed from the rest -- not every point. Not
-// yet implemented; next step on this file.
+// Revision 2 (2026-10-03) -- per-point fallback, not per-candidate: the first version flagged a
+// whole candidate "needs_fallback" the moment ANY one of its points failed the fast-path test,
+// discarding that candidate's entire chi2 for a full O(n_points) CPU recompute. Tested against a
+// realistic light curve (long baseline, tens of near-peak points), that turned out to hit nearly
+// every candidate near the true parameters -- the "rare exception" the original design assumed
+// wasn't rare at all, which would have defeated most of the point of running this on a GPU.
+//
+// The fix follows from one identity: a weighted linear fit's chi2 at its own best-fit (fs, fb)
+// reduces to chi2 = S_yy - fs*S_Ay - fb*S_1y (S_yy = sum w*flux^2; substitute the normal
+// equations into the full quadratic expansion of sum w*(flux - fs*A - fb)^2 to see why) -- i.e.
+// chi2 and (fs, fb) are BOTH fully determined by six running sums (S_AA, S_A1, S_11, S_Ay, S_1y,
+// S_yy), with no need for lightcurve.h's reference implementation's second pass over the data.
+// Those six sums are also trivially SEPARABLE across points: a point's contribution doesn't
+// depend on any other point's. So this kernel accumulates them from the fast-path-OK points
+// only, and separately reports which point INDICES failed the test (not just a yes/no) -- the
+// caller adds each bad point's real (BinaryMagDark-computed) contribution to the six sums itself,
+// then gets the correct fs/fb/chi2 for the whole light curve from the same closed form. The GPU
+// still does the expensive O(n_points) pass over every candidate; the CPU only ever touches the
+// (usually small) per-candidate list of bad points, not the full light curve -- which holds even
+// when most candidates have at least one bad point, unlike revision 1's design.
 #include "kampylos_gpu_mag.cuh"
+#include "kampylos_gpu_types.h"
 #include <cfloat>
 
-struct LightCurvePoint {
-    double t;
-    double flux;
-    double sigma;
-};
+// Tree reduction of running sums across a block, via shared memory -- simple and correct over
+// clever (warp-shuffle combining many independent reductions isn't meaningfully faster here; the
+// magnification math per point dominates cost, not this). NSUMS = 6 statistics + 1 "poisoned" OR
+// flag = 7 lanes.
+#define KAMPYLOS_NREDUCE 7
 
-// Matches fit_binary_local's x[] order (t0, u0, log_tE, alpha, log_rho) -- s and q are fixed for
-// the whole grid cell (passed separately, not per-candidate) since every candidate in one kernel
-// launch belongs to the same (log_s, log_q) cell.
-struct Candidate {
-    double t0;
-    double u0;
-    double log_tE;
-    double alpha;
-    double log_rho;
-};
-
-struct CandidateResult {
-    double chi2;
-    double fs;
-    double fb;
-    int needs_fallback;   // 1 if any data point needed BinaryMagDark -- caller must redo this
-                            // candidate's chi2 on the CPU rather than trust this struct's chi2/fs/fb
-};
-
-// Tree reduction of 7 running sums (S_AA, S_A1, S_11, S_Ay, S_1y, any_invalid, needs_fallback)
-// across a block, via shared memory. One shared double array of size 7*blockDim.x -- simple and
-// correct over clever (warp-shuffle combining across 7 independent reductions isn't meaningfully
-// faster here; the magnification math per point dominates cost, not this).
-__device__ void block_reduce7(double* sh, double* out7) {
+__device__ void block_reduce(double* sh) {
     int tid = threadIdx.x;
     for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
         if (tid < stride) {
-            for (int k = 0; k < 7; k++) {
+            for (int k = 0; k < KAMPYLOS_NREDUCE; k++) {
                 sh[k * blockDim.x + tid] += sh[k * blockDim.x + tid + stride];
             }
         }
         __syncthreads();
     }
-    if (tid == 0) {
-        for (int k = 0; k < 7; k++) out7[k] = sh[k * blockDim.x];
-    }
-    __syncthreads();
 }
 
 extern "C" __global__ void kampylos_eval_candidates(
@@ -89,22 +62,26 @@ extern "C" __global__ void kampylos_eval_candidates(
     int cand_idx = blockIdx.x;
     if (cand_idx >= n_candidates) return;
 
-    extern __shared__ double sh[]; // 7 * blockDim.x doubles
-    double out7[7];
+    extern __shared__ double sh[]; // KAMPYLOS_NREDUCE * blockDim.x doubles
+    // Per-block bad-point collection: a single shared counter, written via atomicAdd so threads
+    // across the block can append concurrently without clobbering each other's slot.
+    __shared__ int bad_count;
+    __shared__ int overflow_flag;
+    if (threadIdx.x == 0) { bad_count = 0; overflow_flag = 0; }
+    __syncthreads();
 
     Candidate c = candidates[cand_idx];
     double tE = exp(c.log_tE);
     double rho = exp(c.log_rho);
 
-    // Same guard as binary_fit.h's objective() -- out-of-range tE/rho short-circuits to a fixed
-    // bad chi2 without evaluating any magnification at all. Uniform across the whole block (same
-    // candidate), so no warp divergence from this branch.
+    // Same guard as binary_fit.h's objective() -- out-of-range tE/rho short-circuits without
+    // evaluating any magnification. Uniform across the whole block (same candidate), so no warp
+    // divergence from this branch.
     if (tE < 0.01 || tE > 10000.0 || rho < 1e-6 || rho > 1.0) {
         if (threadIdx.x == 0) {
-            results[cand_idx].chi2 = 1e18;
-            results[cand_idx].fs = 0;
-            results[cand_idx].fb = 0;
-            results[cand_idx].needs_fallback = 0;
+            CandidateResult* r = &results[cand_idx];
+            r->S_AA = r->S_A1 = r->S_11 = r->S_Ay = r->S_1y = r->S_yy = 0;
+            r->n_bad = 0; r->overflow = 0; r->poisoned = 1; // reuse "poisoned" to signal "dead candidate, chi2=1e18" uniformly to the caller
         }
         return;
     }
@@ -113,8 +90,8 @@ extern "C" __global__ void kampylos_eval_candidates(
     double salpha = sin(c.alpha), calpha = cos(c.alpha);
     double tE_inv = 1.0 / tE;
 
-    double S_AA = 0, S_A1 = 0, S_11 = 0, S_Ay = 0, S_1y = 0;
-    double any_invalid = 0, needs_fallback = 0;
+    double S_AA = 0, S_A1 = 0, S_11 = 0, S_Ay = 0, S_1y = 0, S_yy = 0;
+    double any_invalid = 0;
 
     for (int i = threadIdx.x; i < n_points; i += blockDim.x) {
         double t = data[i].t;
@@ -126,10 +103,16 @@ extern "C" __global__ void kampylos_eval_candidates(
         double A = r.mag;
         if (!(A > 0) || !isfinite(A)) {
             any_invalid = 1.0;
-            continue; // this candidate is dead (chi2=1e18 below) -- no point summing further
+            continue; // whole candidate is dead regardless of n_bad/overflow -- see "poisoned" above
         }
         if (!kgpu::binary_mag2_fastpath_ok(r, rho)) {
-            needs_fallback = 1.0;
+            int slot = atomicAdd(&bad_count, 1);
+            if (slot < KAMPYLOS_MAX_BAD_POINTS) {
+                results[cand_idx].bad_idx[slot] = i;
+            } else {
+                overflow_flag = 1;
+            }
+            continue; // excluded from this block's sums -- caller adds its real contribution
         }
 
         double sigma = data[i].sigma;
@@ -140,6 +123,7 @@ extern "C" __global__ void kampylos_eval_candidates(
         S_11 += w;
         S_Ay += w * A * flux;
         S_1y += w * flux;
+        S_yy += w * flux * flux;
     }
 
     int tid = threadIdx.x;
@@ -148,69 +132,22 @@ extern "C" __global__ void kampylos_eval_candidates(
     sh[2 * blockDim.x + tid] = S_11;
     sh[3 * blockDim.x + tid] = S_Ay;
     sh[4 * blockDim.x + tid] = S_1y;
-    sh[5 * blockDim.x + tid] = any_invalid;
-    sh[6 * blockDim.x + tid] = needs_fallback;
+    sh[5 * blockDim.x + tid] = S_yy;
+    sh[6 * blockDim.x + tid] = any_invalid;
     __syncthreads();
-    block_reduce7(sh, out7);
+    block_reduce(sh);
 
-    if (out7[5] > 0) {
-        // Same short-circuit as objective()'s "if (!isfinite(a) || a <= 0) return 1e18;" --
-        // matches the CPU reference's behavior of treating one bad point as a dead candidate.
-        if (tid == 0) {
-            results[cand_idx].chi2 = 1e18;
-            results[cand_idx].fs = 0;
-            results[cand_idx].fb = 0;
-            results[cand_idx].needs_fallback = 0; // irrelevant -- chi2 is already the CPU-matching sentinel, no recompute needed
-        }
-        return;
-    }
-
-    // fs, fb via the same closed-form weighted linear fit as lightcurve.h's linear_flux_fit().
-    __shared__ double fs_sh, fb_sh;
     if (tid == 0) {
-        double det = out7[0] * out7[2] - out7[1] * out7[1];
-        if (fabs(det) < 1e-300) {
-            fs_sh = 0;
-            fb_sh = out7[2] > 0 ? out7[4] / out7[2] : 0;
+        CandidateResult* r = &results[cand_idx];
+        if (sh[6 * blockDim.x] > 0) {
+            r->S_AA = r->S_A1 = r->S_11 = r->S_Ay = r->S_1y = r->S_yy = 0;
+            r->n_bad = 0; r->overflow = 0; r->poisoned = 1;
         } else {
-            fs_sh = (out7[2] * out7[3] - out7[1] * out7[4]) / det;
-            fb_sh = (out7[0] * out7[4] - out7[1] * out7[3]) / det;
+            r->S_AA = sh[0 * blockDim.x]; r->S_A1 = sh[1 * blockDim.x]; r->S_11 = sh[2 * blockDim.x];
+            r->S_Ay = sh[3 * blockDim.x]; r->S_1y = sh[4 * blockDim.x]; r->S_yy = sh[5 * blockDim.x];
+            r->n_bad = min(bad_count, KAMPYLOS_MAX_BAD_POINTS);
+            r->overflow = overflow_flag;
+            r->poisoned = 0;
         }
-    }
-    __syncthreads();
-    double fs = fs_sh, fb = fb_sh;
-
-    // Second pass for chi2 -- linear_flux_fit() recomputes chi2 directly from (data, mag) rather
-    // than using the sum-of-squares shortcut algebraically available from the 5 S_* sums above,
-    // so this does the same (magnification recomputed per point rather than cached, trading a
-    // second quintic solve per point for not needing O(n_points) of shared/global scratch space
-    // per candidate -- the quintic solve is cheap next to everything else this kernel already
-    // does per point).
-    double chi2_partial = 0;
-    for (int i = threadIdx.x; i < n_points; i += blockDim.x) {
-        double t = data[i].t;
-        double tn = (t - c.t0) * tE_inv;
-        double y1 = c.u0 * salpha - tn * calpha;
-        double y2 = -c.u0 * calpha - tn * salpha;
-        kgpu::BinaryMag0Result r = kgpu::binary_mag0_gpu(s, q, y1, y2);
-        double A = r.mag;
-        double sigma = data[i].sigma;
-        double w = 1.0 / (sigma * sigma);
-        double model = fs * A + fb;
-        double diff = data[i].flux - model;
-        chi2_partial += w * diff * diff;
-    }
-    sh[tid] = chi2_partial;
-    __syncthreads();
-    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-        if (tid < stride) sh[tid] += sh[tid + stride];
-        __syncthreads();
-    }
-
-    if (tid == 0) {
-        results[cand_idx].chi2 = sh[0];
-        results[cand_idx].fs = fs;
-        results[cand_idx].fb = fb;
-        results[cand_idx].needs_fallback = (out7[6] > 0) ? 1 : 0;
     }
 }
