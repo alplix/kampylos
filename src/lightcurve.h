@@ -7,6 +7,7 @@
 #include <sstream>
 #include <cmath>
 #include <stdexcept>
+#include <algorithm>
 
 struct DataPoint {
     double t;      // time, HJD (or HJD - 2450000, whatever the source file uses -- kept
@@ -69,16 +70,36 @@ inline FluxFit linear_flux_fit(const std::vector<DataPoint>& data, const std::ve
         S_Ay += w * A * data[i].flux;
         S_1y += w * data[i].flux;
     }
-    double det = S_AA * S_11 - S_A1 * S_A1;
+    // When A (the model magnification) is nearly constant across the data -- e.g. a PSPL/binary
+    // trial whose timescale is much shorter than the data's own cadence, so essentially no point
+    // actually samples the event -- the 2x2 normal equations above become near-singular, and
+    // fs/fb are jointly almost unconstrained. Solving that system exactly still finds the true
+    // minimum of the (nearly meaningless) chi2 surface for that A, but a *local* optimizer
+    // driving (t0, u0, tE) will discover this and exploit it: it can always walk towards
+    // whatever makes the design more singular, since chi2 keeps improving as fs/fb race off to
+    // huge, cancelling values that overfit noise rather than fit the real signal. This was
+    // confirmed directly and is adversarial, not a one-off: raising the degeneracy threshold
+    // from an absolute 1e-300 cutoff to a relative one, and separately capping |fs|/|fb| against
+    // the data's own flux range, both got defeated in turn -- the optimizer just walked up to
+    // whichever cutoff was in place and rode its edge (e.g. landing fs/fb in the hundreds right
+    // at a 1e-6 relative-determinant cutoff). Any hard cutoff creates a cliff the optimizer can
+    // climb towards from the permissive side.
+    //
+    // The fix is to remove the cliff rather than move it: Tikhonov (ridge) regularization adds a
+    // small, scale-relative damping term to the diagonal of the normal equations. This bounds
+    // fs/fb continuously as the design approaches singularity -- there is no longer a boundary
+    // where chi2 keeps improving right up to a jump, because the ridge term costs a little more
+    // bias the closer the fit leans on an ill-constrained direction, smoothly outweighing
+    // whatever spurious chi2 "gain" a near-singular design offered. lambda is tied to S_11 (the
+    // sum of weights -- the problem's natural scale) rather than an absolute value, and is small
+    // enough (1e-3) to leave any well-conditioned fit (real signal, S_A1^2 well below S_AA*S_11)
+    // essentially unaffected.
+    double lambda = 1e-3 * S_11;
+    double S_AA_r = S_AA + lambda, S_11_r = S_11 + lambda;
+    double det = S_AA_r * S_11_r - S_A1 * S_A1;
     FluxFit out;
-    if (fabs(det) < 1e-300) {
-        // Degenerate (e.g. all magnifications identical) -- fall back to fs=0 fit.
-        out.fs = 0;
-        out.fb = S_11 > 0 ? S_1y / S_11 : 0;
-    } else {
-        out.fs = (S_11 * S_Ay - S_A1 * S_1y) / det;
-        out.fb = (S_AA * S_1y - S_A1 * S_Ay) / det;
-    }
+    out.fs = (S_11_r * S_Ay - S_A1 * S_1y) / det;
+    out.fb = (S_AA_r * S_1y - S_A1 * S_Ay) / det;
     double chi2 = 0;
     for (size_t i = 0; i < n; i++) {
         double w = 1.0 / (data[i].sigma * data[i].sigma);

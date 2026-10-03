@@ -61,8 +61,9 @@ int main(int argc, char** argv) {
         for (int iq = 0; iq < n_q; iq++) {
             double log_q = (n_q == 1) ? log_q_min : log_q_min + (log_q_max - log_q_min) * iq / (n_q - 1);
 
-            BinaryFitResult r = fit_binary_multistart(
-                vbm, data, log_s, log_q, anchor.t0, anchor.u0, anchor.tE
+            BinaryFitResult r = fit_binary_multistart_dual_anchor(
+                vbm, data, log_s, log_q,
+                anchor.t0, anchor.u0, anchor.tE, anchor.t0_raw, anchor.tE_raw
             );
 
             fprintf(out, "%.6f %.6f %.4f %.6f %.6f %.6f %.6f %.6e %.4f %.4f\n",

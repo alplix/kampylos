@@ -127,3 +127,27 @@ inline BinaryFitResult fit_binary_multistart(
     }
     return best;
 }
+
+// Calls fit_binary_multistart twice -- once from the PSPL pre-fit's own optimized (t0, u0, tE)
+// anchor, once from pspl_prefit's independent, purely data-driven fallback anchor (peak time +
+// excess-region width, u0 fixed at a generic 0.3 guess since the fallback has no u0 estimate of
+// its own) -- and keeps whichever converges to the lower chi2. The PSPL optimizer can converge to
+// a physically-degenerate corner (confirmed on real test data in two distinct ways: u0->0 with
+// tE far beyond the data span, or tE far below the cadence) that numerically out-chi2's a
+// genuine fit without being anywhere near the real event; the fallback anchor can't be fooled
+// the same way since it never runs an optimizer at all. This doubles the per-cell cost but, per
+// this file's own established philosophy above, a seed that finds the true minimum is worth far
+// more than the seeds that don't cost less.
+inline BinaryFitResult fit_binary_multistart_dual_anchor(
+    VBMicrolensing& vbm,
+    const std::vector<DataPoint>& data,
+    double log_s, double log_q,
+    double t0_anchor, double u0_anchor, double tE_anchor,
+    double t0_anchor_fallback, double tE_anchor_fallback,
+    double rho_seed = 1e-3,
+    int n_alpha_seeds = 8
+) {
+    BinaryFitResult r1 = fit_binary_multistart(vbm, data, log_s, log_q, t0_anchor, u0_anchor, tE_anchor, rho_seed, n_alpha_seeds);
+    BinaryFitResult r2 = fit_binary_multistart(vbm, data, log_s, log_q, t0_anchor_fallback, 0.3, tE_anchor_fallback, rho_seed, n_alpha_seeds);
+    return (r1.chi2 < r2.chi2) ? r1 : r2;
+}
