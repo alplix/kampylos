@@ -16,6 +16,7 @@
 #include <algorithm>
 #include "kampylos_gpu_types.h"
 #include "kampylos_gpu_complete.h"
+#include "kampylos_cpu_patch_pool.h"
 #include "kampylos_opencl_fit.h"
 #include "nelder_mead_stepper.h"
 #include "kampylos_cl_embedded.h"
@@ -151,10 +152,12 @@ static std::vector<double> opencl_eval_batch(
     std::vector<CandidateResult> h_res(n);
     cl_api.EnqueueReadBuffer(ctx.queue, ctx.d_res, CL_TRUE, 0, n * sizeof(CandidateResult), h_res.data(), 0, NULL, NULL);
 
-    for (int i = 0; i < n; i++) {
-        CompletedFit cf = kampylos_complete_candidate(vbm, h_res[i], points[i], h_data.data(), s, q);
-        chi2[i] = cf.chi2;
-    }
+    // Same fix as gpu_fit_binary.cu's own gpu_eval_batch() (see that file and
+    // kampylos_cpu_patch_pool.h for the full story) -- this loop was the same single-threaded
+    // bottleneck for a pathological anchor, now spread across a small worker-thread pool instead.
+    (void)vbm;
+    static KampylosCpuPatchPool patch_pool(4);
+    patch_pool.complete_batch(h_res, points, h_data.data(), s, q, chi2);
     return chi2;
 }
 

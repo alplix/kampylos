@@ -33,6 +33,7 @@
 
 #include "kampylos_gpu_types.h"
 #include "kampylos_gpu_complete.h"
+#include "kampylos_cpu_patch_pool.h"
 #include "kampylos_metal_fit.h"
 #include "nelder_mead_stepper.h"
 #include "binary_fit.h"
@@ -582,16 +583,23 @@ static std::vector<double> metal_eval_batch(
 
     // Promote the kernel's float output into the shared (double-based) CandidateResult type so
     // kampylos_complete_candidate() -- unchanged, same as every other backend -- can patch in the
-    // bad points via the real VBMicrolensing library and derive the final chi2 in double.
+    // bad points via the real VBMicrolensing library and derive the final chi2 in double. This
+    // conversion pass is cheap (plain struct field copies, no VBMicrolensing calls) and stays
+    // sequential; only the actual patch-completion step below is worth parallelizing.
+    std::vector<CandidateResult> results(n);
     for (int i = 0; i < n; i++) {
-        CandidateResult r;
+        CandidateResult& r = results[i];
         r.S_AA = h_res_f[i].S_AA; r.S_A1 = h_res_f[i].S_A1; r.S_11 = h_res_f[i].S_11;
         r.S_Ay = h_res_f[i].S_Ay; r.S_1y = h_res_f[i].S_1y; r.S_yy = h_res_f[i].S_yy;
         r.n_bad = h_res_f[i].n_bad; r.overflow = h_res_f[i].overflow; r.poisoned = h_res_f[i].poisoned;
         for (int k = 0; k < h_res_f[i].n_bad && k < KAMPYLOS_MAX_BAD_POINTS; k++) r.bad_idx[k] = h_res_f[i].bad_idx[k];
-        CompletedFit cf = kampylos_complete_candidate(vbm, r, points[i], h_data.data(), s, q);
-        chi2[i] = cf.chi2;
     }
+    // Same fix as gpu_fit_binary.cu's own gpu_eval_batch() (see that file and
+    // kampylos_cpu_patch_pool.h for the full story) -- this was the same single-threaded
+    // bottleneck for a pathological anchor, now spread across a small worker-thread pool instead.
+    (void)vbm;
+    static KampylosCpuPatchPool patch_pool(4);
+    patch_pool.complete_batch(results, points, h_data.data(), s, q, chi2);
     return chi2;
 }
 
