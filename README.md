@@ -21,11 +21,13 @@ Public archival photometry from:
 
 ## Status
 
-Early stage: archival photometry is being collected and the core binary-lens solver is not yet written. See the repo's issues/project board for current progress.
+Live and running. The binary-lens solver (grid search + local optimization, using [VBMicrolensing](https://github.com/valboz/VBMicrolensing) for the magnification calculation) is deployed as a real BOINC app across CPU (12 platforms: Linux/Windows/macOS x86_64 and ARM, Android, and several less common architectures) and GPU backends (CUDA, OpenCL, Apple Metal, and MUSA), sharing bitboinc's volunteer compute pool. Several hundred archived OGLE/MOA events have been run through the full grid search so far, with new events being added continuously from the public archives listed above.
+
+Every completed grid is checked against a short automated screen (complete grid coverage, planetary-range mass ratio, a sane flux-fit solution, a genuine interior χ² minimum rather than an edge-of-grid artifact, and a cross-check against the NASA Exoplanet Archive's already-published microlensing planets) before a human looks at it — this catches obvious non-detections and already-known results automatically, so review time goes toward the handful of events that actually need it.
 
 ## Output
 
-Results (grid search χ² maps per event) will be published openly on Zenodo, with anything scientifically notable submitted to [Research Notes of the AAS](https://journals.aas.org/research-notes/).
+Completed grid search results are published openly on [Zenodo](https://zenodo.org), one dataset per event, as they clear review — see the project's public pages at [bitboinc.athena.org.tr](https://bitboinc.athena.org.tr) for the full list and current candidates. Anything that survives review as a genuine, previously-unreported binary-lens signal gets submitted to [Research Notes of the AAS](https://journals.aas.org/research-notes/).
 
 ## Acknowledgments
 
