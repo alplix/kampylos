@@ -15,6 +15,7 @@
 #include "kampylos_gpu_types.h"
 #include "kampylos_gpu_kernel.cu"
 #include "kampylos_gpu_complete.h"
+#include "kampylos_cpu_patch_pool.h"
 #include "nelder_mead_stepper.h"
 #include "gpu_fit_binary.h" // GpuFitContext, BinaryFitResult, function declarations
 
@@ -50,10 +51,29 @@ static std::vector<double> gpu_eval_batch(
     std::vector<CandidateResult> h_res(n);
     CUDA_CHECK_RT(cudaMemcpy(h_res.data(), ctx.d_res, n * sizeof(CandidateResult), cudaMemcpyDeviceToHost));
 
-    for (int i = 0; i < n; i++) {
-        CompletedFit cf = kampylos_complete_candidate(vbm, h_res[i], points[i], h_data.data(), s, q);
-        chi2[i] = cf.chi2;
-    }
+    // Was a single-threaded loop calling kampylos_complete_candidate() once per candidate here,
+    // every round of the batched Nelder-Mead (up to ~1200 rounds/cell) -- fine when each
+    // candidate needs 0-1 points patched, but for a pathological anchor (tE far beyond the
+    // data's own span) a candidate can need many points patched, and this loop dominated
+    // wall-clock: one real-hardware test cell took 91+ minutes, almost entirely here, defeating
+    // the GPU kernel's own speed advantage.
+    //
+    // First attempt at this (2026-10-04, earlier the same night) gave each worker thread its own
+    // VBMicrolensing instance and crashed immediately on real hardware (heap corruption) --
+    // VBMicrolensing's magnification functions turned out to be full of function-local `static`
+    // scratch variables (not reentrant even across separate instances, since a function-local
+    // static is shared by every call to that function from every thread, regardless of which
+    // object made the call). Root-caused and fixed AT THE SOURCE instead of working around it
+    // here: every such static in vendor/kampylos/vendor/VBMicrolensing/VBMicrolensing/lib/
+    // VBMicrolensingLibrary.{cpp,h} is now `thread_local static` (243 of them) -- each thread
+    // gets its own persistent copy (so the library's own intentional cross-call caching, e.g.
+    // BinaryMag0's cached polynomial coefficients for a repeated (s,q), still works correctly
+    // per-thread), while eliminating the cross-thread sharing that caused the crash. Verified
+    // real-hardware-safe (see kampylos_cpu_patch_pool.h's own history note) before this file was
+    // changed back to use it.
+    (void)vbm;
+    static KampylosCpuPatchPool patch_pool(4);
+    patch_pool.complete_batch(h_res, points, h_data.data(), s, q, chi2);
     return chi2;
 }
 
