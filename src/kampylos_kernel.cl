@@ -17,33 +17,33 @@
 
 typedef struct { double re, im; } cx;
 
-inline cx cx_make(double re, double im) { cx z; z.re = re; z.im = im; return z; }
-inline cx cx_add(cx a, cx b) { return cx_make(a.re + b.re, a.im + b.im); }
-inline cx cx_sub(cx a, cx b) { return cx_make(a.re - b.re, a.im - b.im); }
-inline cx cx_mul(cx a, cx b) { return cx_make(a.re * b.re - a.im * b.im, a.re * b.im + a.im * b.re); }
-inline cx cx_div(cx a, cx b) {
+static inline cx cx_make(double re, double im) { cx z; z.re = re; z.im = im; return z; }
+static inline cx cx_add(cx a, cx b) { return cx_make(a.re + b.re, a.im + b.im); }
+static inline cx cx_sub(cx a, cx b) { return cx_make(a.re - b.re, a.im - b.im); }
+static inline cx cx_mul(cx a, cx b) { return cx_make(a.re * b.re - a.im * b.im, a.re * b.im + a.im * b.re); }
+static inline cx cx_div(cx a, cx b) {
     double md = b.re * b.re + b.im * b.im;
     return cx_make((a.re * b.re + a.im * b.im) / md, (a.im * b.re - a.re * b.im) / md);
 }
-inline cx cx_scale(cx z, double a) { return cx_make(z.re * a, z.im * a); }
-inline cx cx_neg(cx z) { return cx_make(-z.re, -z.im); }
-inline int cx_eq(cx a, cx b) { return a.re == b.re && a.im == b.im; }
-inline double cx_abs2(cx z) { return z.re * z.re + z.im * z.im; }
-inline double cx_abs(cx z) { return sqrt(z.re * z.re + z.im * z.im); }
-inline cx cx_conj(cx z) { return cx_make(z.re, -z.im); }
-inline cx cx_sqrt(cx z) {
+static inline cx cx_scale(cx z, double a) { return cx_make(z.re * a, z.im * a); }
+static inline cx cx_neg(cx z) { return cx_make(-z.re, -z.im); }
+static inline int cx_eq(cx a, cx b) { return a.re == b.re && a.im == b.im; }
+static inline double cx_abs2(cx z) { return z.re * z.re + z.im * z.im; }
+static inline double cx_abs(cx z) { return sqrt(z.re * z.re + z.im * z.im); }
+static inline cx cx_conj(cx z) { return cx_make(z.re, -z.im); }
+static inline cx cx_sqrt(cx z) {
     double md = sqrt(z.re * z.re + z.im * z.im);
     if (md <= 0) return cx_make(0, 0);
     return cx_make(sqrt((md + z.re) / 2), sqrt((md - z.re) / 2) * ((z.im > 0) ? 1.0 : -1.0));
 }
-inline cx cx_exp(cx z) {
+static inline cx cx_exp(cx z) {
     double r = exp(z.re);
     return cx_make(r * cos(z.im), r * sin(z.im));
 }
 
 #define KAMPYLOS_CL_MAXIT 2000
 
-inline double kgpu_abs2poly(const cx* poly, int degree, cx z) {
+static inline double kgpu_abs2poly(const cx* poly, int degree, cx z) {
     cx pv = poly[degree];
     for (int k = degree - 1; k >= 0; k--) pv = cx_add(poly[k], cx_mul(z, pv));
     return cx_mul(cx_conj(pv), pv).re;
@@ -53,7 +53,7 @@ inline double kgpu_abs2poly(const cx* poly, int degree, cx z) {
 // via plain Laguerre with deflation, not the full Laguerre->SG->Newton hybrid
 // cmplx_roots_gen() uses): fewer code paths to get wrong on a port, same guaranteed-ish
 // convergence, see kampylos_gpu_mag.cuh's own comment for the full rationale.
-inline void kgpu_cmplx_laguerre(const cx* poly, int degree, cx* root) {
+static inline void kgpu_cmplx_laguerre(const cx* poly, int degree, cx* root) {
     const double FRAC_JUMPS[10] = { 0.64109297, 0.91577881, 0.25921289, 0.50487203,
         0.08177045, 0.13653241, 0.306162, 0.37794326, 0.04618805, 0.75132137 };
     const double FRAC_ERR = 2.0e-15;
@@ -112,7 +112,7 @@ inline void kgpu_cmplx_laguerre(const cx* poly, int degree, cx* root) {
     }
 }
 
-inline void kgpu_cmplx_newton_spec(const cx* poly, int degree, cx* root) {
+static inline void kgpu_cmplx_newton_spec(const cx* poly, int degree, cx* root) {
     const double FRAC_JUMPS[10] = { 0.64109297, 0.91577881, 0.25921289, 0.50487203,
         0.08177045, 0.13653241, 0.306162, 0.37794326, 0.04618805, 0.75132137 };
     const double FRAC_ERR = 2.0e-15;
@@ -164,7 +164,7 @@ inline void kgpu_cmplx_newton_spec(const cx* poly, int degree, cx* root) {
     }
 }
 
-inline void kgpu_solve_quadratic_eq(cx* x0, cx* x1, const cx* poly) {
+static inline void kgpu_solve_quadratic_eq(cx* x0, cx* x1, const cx* poly) {
     cx a = poly[2], b = poly[1], c = poly[0];
     cx b2 = cx_mul(b, b);
     cx delta = cx_sqrt(cx_sub(b2, cx_scale(cx_mul(a, c), 4.0)));
@@ -180,7 +180,7 @@ inline void kgpu_solve_quadratic_eq(cx* x0, cx* x1, const cx* poly) {
 
 #define KAMPYLOS_CL_MAXDEG 6
 
-inline void kgpu_roots_gen(cx* roots, const cx* poly, int degree) {
+static inline void kgpu_roots_gen(cx* roots, const cx* poly, int degree) {
     cx poly2[KAMPYLOS_CL_MAXDEG];
     for (int j = 0; j <= degree; j++) poly2[j] = poly[j];
     for (int j = 0; j < degree; j++) roots[j] = cx_make(0, 0);
@@ -209,7 +209,7 @@ typedef struct {
     int n_images;
 } BinaryMag0Result;
 
-inline BinaryMag0Result binary_mag0_gpu(double s, double q, double y1v, double y2v) {
+static inline BinaryMag0Result binary_mag0_gpu(double s, double q, double y1v, double y2v) {
     BinaryMag0Result out;
     out.mag = -1.0; out.corrquad = 0.0; out.corrquad2 = 0.0; out.safedist = 10.0; out.n_images = 0;
 
@@ -350,7 +350,7 @@ inline BinaryMag0Result binary_mag0_gpu(double s, double q, double y1v, double y
     return out;
 }
 
-inline int binary_mag2_fastpath_ok(const BinaryMag0Result* r, double rho, double Tol) {
+static inline int binary_mag2_fastpath_ok(const BinaryMag0Result* r, double rho, double Tol) {
     double rho2 = rho * rho;
     double cq = r->corrquad * 6.0 * (rho2 + 1.e-4 * Tol);
     double cq2 = r->corrquad2 * 256.0 * (rho2 + 1.e-8);
