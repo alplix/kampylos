@@ -14,12 +14,33 @@
 #define M_PI 3.14159265358979323846
 #endif
 #include <algorithm>
+#include <cctype>
 #include "kampylos_gpu_types.h"
 #include "kampylos_gpu_complete.h"
 #include "kampylos_cpu_patch_pool.h"
 #include "kampylos_opencl_fit.h"
 #include "nelder_mead_stepper.h"
 #include "kampylos_cl_embedded.h"
+
+// 2026-10-06, forum thread 64 ("Intel GPU tasks run on Nvidia") -- see opencl_search.c's
+// (Potamos's) identical fix for the full writeup. Each vendor-specific opencl_* plan_class now
+// gets its own physical binary with this baked in at compile time.
+#ifndef EXPECTED_GPU_VENDOR
+#define EXPECTED_GPU_VENDOR ""
+#endif
+
+static bool platform_vendor_matches(cl_platform_id p) {
+    if (EXPECTED_GPU_VENDOR[0] == '\0') return true;
+    char vendor[256] = {0};
+    cl_api.GetPlatformInfo(p, CL_PLATFORM_VENDOR, sizeof(vendor), vendor, NULL);
+    char lower[256];
+    size_t i;
+    for (i = 0; vendor[i] && i + 1 < sizeof(lower); i++) {
+        lower[i] = (char)tolower((unsigned char)vendor[i]);
+    }
+    lower[i] = '\0';
+    return strstr(lower, EXPECTED_GPU_VENDOR) != NULL;
+}
 
 OpenCLFitContext::~OpenCLFitContext() {
     if (d_data) cl_api.ReleaseMemObject(d_data);
@@ -52,6 +73,7 @@ bool opencl_fit_select_device(OpenCLFitContext& ctx, int device_id, std::string*
     cl_platform_id platform = 0;
     cl_uint n_devices = 0;
     for (cl_uint i = 0; i < n_platforms; i++) {
+        if (!platform_vendor_matches(platforms[i])) continue;
         cl_uint n = 0;
         if (cl_api.GetDeviceIDs(platforms[i], CL_DEVICE_TYPE_ALL, 0, NULL, &n) == CL_SUCCESS && n > 0) {
             platform = platforms[i];
@@ -60,7 +82,9 @@ bool opencl_fit_select_device(OpenCLFitContext& ctx, int device_id, std::string*
         }
     }
     if (!platform) {
-        if (err_out) *err_out = "no OpenCL devices found on any platform";
+        if (err_out) *err_out = EXPECTED_GPU_VENDOR[0]
+            ? (std::string("no \"") + EXPECTED_GPU_VENDOR + "\" OpenCL devices found on any platform")
+            : "no OpenCL devices found on any platform";
         return false;
     }
     std::vector<cl_device_id> devices(n_devices);
