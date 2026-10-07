@@ -30,16 +30,7 @@
 #endif
 
 static bool platform_vendor_matches(cl_platform_id p) {
-    if (EXPECTED_GPU_VENDOR[0] == '\0') return true;
-    char vendor[256] = {0};
-    cl_api.GetPlatformInfo(p, CL_PLATFORM_VENDOR, sizeof(vendor), vendor, NULL);
-    char lower[256];
-    size_t i;
-    for (i = 0; vendor[i] && i + 1 < sizeof(lower); i++) {
-        lower[i] = (char)tolower((unsigned char)vendor[i]);
-    }
-    lower[i] = '\0';
-    return strstr(lower, EXPECTED_GPU_VENDOR) != NULL;
+    return cl_platform_matches_vendor(p, EXPECTED_GPU_VENDOR) != 0;
 }
 
 OpenCLFitContext::~OpenCLFitContext() {
