@@ -22,6 +22,38 @@ struct PsplFit {
     double t0_raw, tE_raw;
 };
 
+// Independent, optimizer-free timescale estimate: the width of the contiguous region around
+// t0_peak whose flux stays above (median + 3 typical sigma), converted to a Gaussian-equivalent
+// sigma (FWHM/2.355) and clamped to [1 d, span/3]. Only an order-of-magnitude seed.
+inline void raw_peak_anchor(const std::vector<DataPoint>& data, double t0_peak,
+                            double* t0_raw, double* tE_raw_out) {
+    *t0_raw = t0_peak;
+    double t_span = data.back().t - data.front().t;
+    std::vector<double> fluxes;
+    fluxes.reserve(data.size());
+    for (const auto& d : data) fluxes.push_back(d.flux);
+    std::sort(fluxes.begin(), fluxes.end());
+    double baseline = fluxes[fluxes.size() / 2];  // median -- robust as long as the event
+                                                    // doesn't cover most of the baseline.
+    double typical_sigma = data[data.size() / 2].sigma;
+    double thresh = baseline + 3.0 * typical_sigma;
+    size_t peak_idx = 0;
+    double best_dt = 1e300;
+    for (size_t i = 0; i < data.size(); i++) {
+        double dt = std::fabs(data[i].t - t0_peak);
+        if (dt < best_dt) { best_dt = dt; peak_idx = i; }
+    }
+    size_t lo = peak_idx, hi = peak_idx;
+    while (lo > 0 && data[lo - 1].flux > thresh) lo--;
+    while (hi + 1 < data.size() && data[hi + 1].flux > thresh) hi++;
+    double width = data[hi].t - data[lo].t;
+    double tE_raw = width / 2.355;  // excess-region FWHM -> Gaussian-equivalent sigma, used
+                                      // only as an order-of-magnitude timescale seed.
+    tE_raw = std::max(tE_raw, 1.0);
+    tE_raw = std::min(tE_raw, std::max(t_span / 3.0, 1.0));
+    *tE_raw_out = tE_raw;
+}
+
 inline PsplFit pspl_prefit(VBMicrolensing& vbm, const std::vector<DataPoint>& data) {
     // Seed t0 from the highest-flux point (a real anchor -- the peak of a microlensing event
     // is, almost by definition, near its highest observed flux).
@@ -70,27 +102,6 @@ inline PsplFit pspl_prefit(VBMicrolensing& vbm, const std::vector<DataPoint>& da
         }
     }
 
-    best.t0_raw = t0_seed;
-    {
-        std::vector<double> fluxes;
-        fluxes.reserve(data.size());
-        for (const auto& d : data) fluxes.push_back(d.flux);
-        std::sort(fluxes.begin(), fluxes.end());
-        double baseline = fluxes[fluxes.size() / 2];  // median -- robust as long as the event
-                                                        // doesn't cover most of the baseline.
-        double typical_sigma = data[data.size() / 2].sigma;
-        double thresh = baseline + 3.0 * typical_sigma;
-        size_t peak_idx = 0;
-        for (size_t i = 0; i < data.size(); i++) if (data[i].t == t0_seed) { peak_idx = i; break; }
-        size_t lo = peak_idx, hi = peak_idx;
-        while (lo > 0 && data[lo - 1].flux > thresh) lo--;
-        while (hi + 1 < data.size() && data[hi + 1].flux > thresh) hi++;
-        double width = data[hi].t - data[lo].t;
-        double tE_raw = width / 2.355;  // excess-region FWHM -> Gaussian-equivalent sigma, used
-                                          // only as an order-of-magnitude timescale seed.
-        tE_raw = std::max(tE_raw, 1.0);
-        tE_raw = std::min(tE_raw, t_span / 3.0);
-        best.tE_raw = tE_raw;
-    }
+    raw_peak_anchor(data, t0_seed, &best.t0_raw, &best.tE_raw);
     return best;
 }

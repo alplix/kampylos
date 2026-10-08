@@ -27,6 +27,18 @@ void metal_fit_upload_light_curve(MetalFitContext& ctx, const std::vector<DataPo
 
 class VBMicrolensing;
 
+// Metal twin of gpu_fit_binary_seeds() (see gpu_fit_binary.h): runs every seed of a
+// kampylos_make_seeds() set at one grid cell, ln_s/ln_q natural logs; the work-unit driver
+// recomputes chi2/fs/fb exactly on the host afterwards.
+BinaryFitResult metal_fit_binary_seeds(
+    MetalFitContext& ctx,
+    const std::vector<DataPoint>& data,
+    double ln_s, double ln_q,
+    const BinarySeedSet& seeds,
+    int n_restarts = 2
+);
+
+// Legacy entry point (unit tests): the 96-seed multistart around one anchor.
 BinaryFitResult metal_fit_binary_multistart(
     MetalFitContext& ctx,
     VBMicrolensing& vbm,

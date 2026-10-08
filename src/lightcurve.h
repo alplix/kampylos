@@ -51,14 +51,90 @@ inline std::vector<DataPoint> load_photometry(const std::string& path, bool inpu
 struct FluxFit {
     double fs, fb;   // source flux, blend flux
     double chi2;
+    int degenerate;  // 0 = exact least squares; 1 = near-singular design, tiny-ridge fallback
+                     // used; 2 = fs/fb sanity backstop tripped (constant-flux model returned)
 };
+
+// Relative-determinant threshold below which the 2x2 normal equations count as genuinely
+// near-singular. rel_det = det / (S_AA*S_11) = 1 - <A>^2/<A^2> (weighted), i.e. the weighted
+// variance of the magnification across the data divided by its mean square. Any light curve
+// that actually samples an event has rel_det >= ~1e-6 (a 0.1% magnification change on a few
+// points already gives that); 1e-10 means A is constant to ~1e-5 relative across EVERY point --
+// a trial so far from the data (tE >> span, or the event entirely between points) that fs and
+// fb are genuinely not separable.
+#define KAMPYLOS_FLUX_RELDET_MIN 1e-10
+// Size of the fallback ridge, relative to each diagonal entry. Only ever applied below
+// KAMPYLOS_FLUX_RELDET_MIN, where the model prediction fs*A+fb is (to ~1e-5) the same along
+// the whole degenerate fs/fb direction, so this cannot change chi2 by more than a rounding
+// error -- it only picks a finite point on that flat valley.
+#define KAMPYLOS_FLUX_RIDGE 1e-8
+
+// The one closed-form (fs, fb) solve shared by every backend: linear_flux_fit() below (CPU)
+// and kampylos_complete_candidate() (CUDA/OpenCL/Metal host completion) both call this, so
+// the backends cannot drift apart in how fs/fb are chosen.
+//
+// History (2026-10-08 fix): this used to scale BOTH diagonal entries by 1.01 unconditionally
+// (eps_reg = 1e-2 Tikhonov damping), added because optimizers walked into near-singular
+// designs and rode them. That damping biases fs/fb for EVERY trial, and chi2 was then evaluated
+// at the biased fs/fb -- verified on MOA-2003-BLG-004 to inflate chi2 by hundreds to thousands
+// (worse for high-magnification trials, where fs carries most of the model), and by a
+// different amount for the binary grid cells than for the single-lens anchor, so delta_chi2
+// was meaningless. Now: exact unregularized least squares whenever the design is not
+// genuinely singular (rel_det >= KAMPYLOS_FLUX_RELDET_MIN); a tiny ridge only below that; and
+// the independent fs/fb sanity backstop (|fs| or |fb| > fs_bound -> constant-flux model, which
+// can only make chi2 WORSE, so it never rewards an optimizer for approaching it).
+// fb_offset: constant that was subtracted from every flux before the sums were formed (the GPU
+// paths centre the light curve); the backstop is applied to the uncentred fb, fb + fb_offset.
+inline FluxFit flux_fit_solve(double S_AA, double S_A1, double S_11, double S_Ay, double S_1y,
+                              double fs_bound, double fb_offset = 0.0) {
+    FluxFit out;
+    out.chi2 = 0;
+    out.degenerate = 0;
+    double diag = S_AA * S_11;
+    double det = diag - S_A1 * S_A1;
+    if (!(diag > 0) || !(det > KAMPYLOS_FLUX_RELDET_MIN * diag)) {
+        double a = S_AA * (1.0 + KAMPYLOS_FLUX_RIDGE), b = S_11 * (1.0 + KAMPYLOS_FLUX_RIDGE);
+        det = a * b - S_A1 * S_A1;
+        if (det > 0) {
+            out.fs = (b * S_Ay - S_A1 * S_1y) / det;
+            out.fb = (a * S_1y - S_A1 * S_Ay) / det;
+        } else {
+            out.fs = 0;
+            out.fb = S_11 > 0 ? S_1y / S_11 : 0;
+        }
+        out.degenerate = 1;
+    } else {
+        out.fs = (S_11 * S_Ay - S_A1 * S_1y) / det;
+        out.fb = (S_AA * S_1y - S_A1 * S_Ay) / det;
+    }
+    // Backstop (unchanged in spirit from the original design): a real fit's fs/fb are flux
+    // contributions in the data's own units and cannot legitimately run to 1000x the observed
+    // flux range. The bound is the light curve's flux RANGE (max - min), which is invariant
+    // under a constant flux offset -- the GPU paths centre the flux before upload, and this
+    // keeps the bound identical on every backend.
+    if (!std::isfinite(out.fs) || !std::isfinite(out.fb) ||
+        std::fabs(out.fs) > fs_bound || std::fabs(out.fb + fb_offset) > fs_bound) {
+        out.fs = 0;
+        out.fb = S_11 > 0 ? S_1y / S_11 : 0;
+        out.degenerate = 2;
+    }
+    return out;
+}
+
+// 1000x the light curve's flux range -- see flux_fit_solve(). Computed once per light curve.
+inline double flux_fit_bound(const std::vector<DataPoint>& data) {
+    if (data.empty()) return 1e300;
+    double lo = data[0].flux, hi = data[0].flux;
+    for (const auto& d : data) { lo = std::min(lo, d.flux); hi = std::max(hi, d.flux); }
+    return 1e3 * std::max(hi - lo, 1e-12);
+}
 
 // Given a magnification model evaluated at every data point, finds the best-fit (fs, fb) in
 // closed form (model flux = fs*A + fb is linear in fs, fb for fixed A) and returns the
-// resulting chi-squared. This is standard practice in microlensing fitting: it removes two
-// parameters from every nonlinear optimization step for free, since they never need a
-// numerical search to begin with.
-inline FluxFit linear_flux_fit(const std::vector<DataPoint>& data, const std::vector<double>& mag) {
+// resulting chi-squared, evaluated directly from the residuals at exactly those fs/fb.
+// fs_bound: pass flux_fit_bound(data) when calling this in a loop; <= 0 computes it here.
+inline FluxFit linear_flux_fit(const std::vector<DataPoint>& data, const std::vector<double>& mag,
+                               double fs_bound = -1.0) {
     double S_AA = 0, S_A1 = 0, S_11 = 0, S_Ay = 0, S_1y = 0;
     size_t n = data.size();
     for (size_t i = 0; i < n; i++) {
@@ -70,71 +146,12 @@ inline FluxFit linear_flux_fit(const std::vector<DataPoint>& data, const std::ve
         S_Ay += w * A * data[i].flux;
         S_1y += w * data[i].flux;
     }
-    // When A (the model magnification) is nearly constant across the data -- e.g. a PSPL/binary
-    // trial whose timescale is much shorter than the data's own cadence, so essentially no point
-    // actually samples the event -- the 2x2 normal equations above become near-singular, and
-    // fs/fb are jointly almost unconstrained. Solving that system exactly still finds the true
-    // minimum of the (nearly meaningless) chi2 surface for that A, but a *local* optimizer
-    // driving (t0, u0, tE) will discover this and exploit it: it can always walk towards
-    // whatever makes the design more singular, since chi2 keeps improving as fs/fb race off to
-    // huge, cancelling values that overfit noise rather than fit the real signal. This was
-    // confirmed directly and is adversarial, not a one-off: raising the degeneracy threshold
-    // from an absolute 1e-300 cutoff to a relative one, and separately capping |fs|/|fb| against
-    // the data's own flux range, both got defeated in turn -- the optimizer just walked up to
-    // whichever cutoff was in place and rode its edge (e.g. landing fs/fb in the hundreds right
-    // at a 1e-6 relative-determinant cutoff). Any hard cutoff creates a cliff the optimizer can
-    // climb towards from the permissive side.
-    //
-    // The fix is to remove the cliff rather than move it: Tikhonov (ridge) regularization adds a
-    // small, scale-relative damping term to the diagonal of the normal equations. This bounds
-    // fs/fb continuously as the design approaches singularity -- there is no longer a boundary
-    // where chi2 keeps improving right up to a jump, because the ridge term costs a little more
-    // bias the closer the fit leans on an ill-constrained direction, smoothly outweighing
-    // whatever spurious chi2 "gain" a near-singular design offered.
-    //
-    // A first version added the same lambda (tied only to S_11) to both diagonal entries. That
-    // works fine when the model magnification A is O(1), but S_AA scales like A^2 while S_11
-    // doesn't scale with A at all -- for a high-magnification trial (common right near a
-    // caustic), S_AA can be orders of magnitude above S_11, making an S_11-only lambda negligible
-    // next to S_AA and leaving that entry essentially unregularized. Confirmed directly: the GPU
-    // backend still reported fs/fb in the hundreds of thousands for exactly this kind of trial
-    // even with that fix in place. Each diagonal entry now gets damped relative to ITS OWN
-    // magnitude instead (equivalent to scaling both by a constant factor near 1), so the
-    // regularization strength tracks whichever term actually needs it regardless of A's scale.
-    double eps_reg = 1e-2;
-    double S_AA_r = S_AA * (1.0 + eps_reg), S_11_r = S_11 * (1.0 + eps_reg);
-    double det = S_AA_r * S_11_r - S_A1 * S_A1;
-    FluxFit out;
-    out.fs = (S_11_r * S_Ay - S_A1 * S_1y) / det;
-    out.fb = (S_AA_r * S_1y - S_A1 * S_Ay) / det;
-    // Proportional regularization alone turned out not to be a complete fix either: worked out
-    // on paper, in the EXACTLY-constant-A limit the eps term algebraically cancels out of fs/fb
-    // entirely, leaving a finite but data-noise-dominated value -- and confirmed directly, a
-    // trial far enough out (tE far beyond the data span, magnification nearly constant to within
-    // floating-point noise) still produced fs/fb in the tens of thousands. Since no amount of
-    // continuous regularization removes every pathological corner (the near-constant-A case is a
-    // genuine, not just numerical, degeneracy -- fs/fb truly are unconstrained there), this adds
-    // a second, independent line of defense: a sanity bound on the SOLVED fs/fb against the
-    // data's own flux scale. A real fit's fs/fb are flux contributions in the same units as the
-    // data, so they cannot legitimately run to 1000x the observed spread. This is a backstop, not
-    // the primary defense -- the regularization above already removes most of the incentive to
-    // approach this corner, so this should rarely trigger for a genuine fit, only for the
-    // remaining pathological trials that still find their way to it.
-    double flux_lo = data[0].flux, flux_hi = data[0].flux;
-    for (size_t i = 0; i < n; i++) {
-        flux_lo = std::min(flux_lo, data[i].flux);
-        flux_hi = std::max(flux_hi, data[i].flux);
-    }
-    double fs_bound = 1e3 * std::max(flux_hi - flux_lo, 1e-12);
-    if (std::fabs(out.fs) > fs_bound || std::fabs(out.fb) > fs_bound) {
-        out.fs = 0;
-        out.fb = S_11 > 0 ? S_1y / S_11 : 0;
-    }
+    if (fs_bound <= 0) fs_bound = flux_fit_bound(data);
+    FluxFit out = flux_fit_solve(S_AA, S_A1, S_11, S_Ay, S_1y, fs_bound);
     double chi2 = 0;
     for (size_t i = 0; i < n; i++) {
-        double w = 1.0 / (data[i].sigma * data[i].sigma);
-        double resid = data[i].flux - (out.fs * mag[i] + out.fb);
-        chi2 += w * resid * resid;
+        double resid = (data[i].flux - (out.fs * mag[i] + out.fb)) / data[i].sigma;
+        chi2 += resid * resid;
     }
     out.chi2 = chi2;
     return out;

@@ -24,6 +24,11 @@
 struct GpuFitContext {
     LightCurvePoint* d_data = nullptr;
     int n_points = 0;
+    // Host copy of exactly what was uploaded (flux-centred, see gpu_upload_light_curve()), plus
+    // the per-light-curve constants every completion step needs.
+    std::vector<LightCurvePoint> h_data;
+    double flux_offset = 0.0;  // weighted mean flux subtracted before upload
+    double fs_bound = 1e300;   // flux_fit_bound() of the original light curve
     int data_capacity = 0;
     Candidate* d_cand = nullptr;
     CandidateResult* d_res = nullptr;
@@ -75,6 +80,21 @@ struct GpuFitContext {
 
 void gpu_upload_light_curve(GpuFitContext& ctx, const std::vector<DataPoint>& data);
 
+// Runs every seed of a kampylos_make_seeds() set (batched, see gpu_fit_binary.cu) at one grid
+// cell. ln_s/ln_q are NATURAL logs. Returns the best parameter vector; chi2 is the GPU-path
+// value -- the work-unit driver recomputes chi2/fs/fb exactly on the host
+// (kampylos_finalize_cell) so every backend reports the same numbers for the same parameters.
+// Requires gpu_upload_light_curve() to have been called for `data` first.
+BinaryFitResult gpu_fit_binary_seeds(
+    GpuFitContext& ctx,
+    const std::vector<DataPoint>& data,
+    double ln_s, double ln_q,
+    const BinarySeedSet& seeds,
+    int n_restarts = 2
+);
+
+// Legacy entry point (unit tests): the 96-seed multistart around one anchor. Uploads `data`
+// itself if it isn't the light curve currently on the device.
 BinaryFitResult gpu_fit_binary_multistart(
     GpuFitContext& ctx,
     VBMicrolensing& vbm,

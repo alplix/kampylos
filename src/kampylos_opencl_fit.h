@@ -8,6 +8,7 @@
 // does the same with cl_dynload.h/OpenCL types.
 #include <string>
 #include <vector>
+#include "kampylos_gpu_types.h"
 #include "cl_dynload.h" // cl_api, cl_context/cl_command_queue/... (includes <CL/cl.h>)
 #include "binary_fit.h" // BinaryFitResult
 #include "lightcurve.h" // DataPoint
@@ -21,6 +22,9 @@ struct OpenCLFitContext {
 
     cl_mem d_data = nullptr;
     int n_points = 0;
+    std::vector<LightCurvePoint> h_data; // flux-centred host copy of what was uploaded
+    double flux_offset = 0.0;            // weighted mean flux subtracted before upload
+    double fs_bound = 1e300;             // flux_fit_bound() of the original light curve
     cl_mem d_cand = nullptr;
     cl_mem d_res = nullptr;
     int cand_capacity = 0;
@@ -40,6 +44,18 @@ void opencl_fit_upload_light_curve(OpenCLFitContext& ctx, const std::vector<Data
 // VBMicrolensing's full definition already arrived via binary_fit.h's own #include chain above --
 // no separate pull-in or forward declare needed here (same note as gpu_fit_binary.h).
 
+// OpenCL twin of gpu_fit_binary_seeds() (see gpu_fit_binary.h): runs every seed of a
+// kampylos_make_seeds() set at one grid cell, ln_s/ln_q natural logs; the work-unit driver
+// recomputes chi2/fs/fb exactly on the host afterwards.
+BinaryFitResult opencl_fit_binary_seeds(
+    OpenCLFitContext& ctx,
+    const std::vector<DataPoint>& data,
+    double ln_s, double ln_q,
+    const BinarySeedSet& seeds,
+    int n_restarts = 2
+);
+
+// Legacy entry point (unit tests): the 96-seed multistart around one anchor.
 BinaryFitResult opencl_fit_binary_multistart(
     OpenCLFitContext& ctx,
     VBMicrolensing& vbm,

@@ -378,9 +378,10 @@ typedef struct LightCurvePoint LightCurvePoint;
 typedef struct Candidate Candidate;
 typedef struct CandidateResult CandidateResult;
 
+// s, q are LINEAR separation and mass ratio (2026-10-08, see kampylos_gpu_kernel.cu).
 __kernel void kampylos_eval_candidates(
     __global const LightCurvePoint* data, int n_points,
-    double log_s, double log_q,
+    double s, double q,
     __global const Candidate* candidates, int n_candidates,
     __global CandidateResult* results,
     __local double* sh,             // 7 * local_size doubles
@@ -409,7 +410,6 @@ __kernel void kampylos_eval_candidates(
         return;
     }
 
-    double s = exp(log_s), q = exp(log_q);
     double salpha = sin(c.alpha), calpha = cos(c.alpha);
     double tE_inv = 1.0 / tE;
 

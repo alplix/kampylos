@@ -80,7 +80,7 @@ int main() {
 
     int block_size = 128;
     size_t shmem = KAMPYLOS_NREDUCE * block_size * sizeof(double);
-    kampylos_eval_candidates<<<n_cand, block_size, shmem>>>(d_data, n_points, true_log_s, true_log_q, d_cand, n_cand, d_res);
+    kampylos_eval_candidates<<<n_cand, block_size, shmem>>>(d_data, n_points, exp(true_log_s), exp(true_log_q), d_cand, n_cand, d_res);
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
 

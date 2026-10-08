@@ -45,31 +45,50 @@
 // -- this is a GPU app; volunteers running it alongside other CPU work haven't committed a whole
 // core's worth of CPU time to it, and over-subscribing would be exactly the kind of "GPU app eating
 // all my CPU too" complaint this project has already had to fix once (app.weight/credit tuning
-// earlier). Spawns/joins fresh std::threads each batch rather than keeping a persistent pool with a
-// work queue -- simpler, and the batches here are large enough (tens to hundreds of candidates for
-// a pathological cell, which is exactly the case this exists to speed up) that thread-spawn
-// overhead (microseconds) is negligible next to the CPU patch work itself (which is the whole
-// problem). Falls back to inline (no threads) for small batches, where spawning would cost more
-// than it saves.
+// earlier). (The first version spawned/joined fresh std::threads each batch -- replaced by
+// persistent workers on 2026-10-08, see below.) Falls back to inline (no threads) for small
+// batches, where handing work to the workers would cost more than it saves.
+//
+// 2026-10-08, PERSISTENT WORKERS: the pool used to spawn and join fresh std::threads for every
+// batch. Every thread exit runs the destructors of VBMicrolensing's thread_local scratch objects
+// (see above), and with MinGW-w64 (winpthreads/emutls) one of those, an
+// _augmented_priority_queue, frees memory it does not own -> heap corruption, process killed
+// with 0xC0000374 within the first cell (reproduced with a MinGW build of the OpenCL path; MSVC
+// and Linux/glibc builds happened not to trip it). The vendored library must not be modified, so
+// the workers are now created ONCE, kept for the life of the process and never exit: no
+// thread_local destructor ever runs. Callers create the pool with `new` and never delete it, so
+// no static destructor tries to join them at exit either (process exit simply ends them).
+// The calling thread does share 0 of every batch itself, so n_threads = 4 still means 4 CPU
+// threads busy, as before.
 #include <thread>
 #include <vector>
 #include <algorithm>
+#include <mutex>
+#include <condition_variable>
 #include "kampylos_gpu_complete.h"
 
 class KampylosCpuPatchPool {
 public:
     explicit KampylosCpuPatchPool(int n_threads = 4)
-        : vbms_(std::max(1, n_threads)) {}
+        : vbms_(std::max(1, n_threads)) {
+        for (int t = 1; t < (int)vbms_.size(); t++) workers_.emplace_back([this, t]() { worker_loop(t); });
+    }
+    KampylosCpuPatchPool(const KampylosCpuPatchPool&) = delete;
+    KampylosCpuPatchPool& operator=(const KampylosCpuPatchPool&) = delete;
+    // Never destroyed in practice (see above); detach rather than join if it ever is.
+    ~KampylosCpuPatchPool() { for (auto& w : workers_) w.detach(); }
 
     // Completes `results[i]`/`points[i]` pairs (same data/s/q for every one -- one grid cell's
     // worth), writing chi2_out[i] for each, in the SAME order as the input. Safe to call
-    // repeatedly on the same instance (that's the point -- one pool per WU, reused every round).
+    // repeatedly on the same instance (that's the point -- one pool per process, reused every
+    // round). Not reentrant: one batch at a time.
     void complete_batch(
         const std::vector<CandidateResult>& results,
         const std::vector<Candidate>& points,
         const LightCurvePoint* data,
         double s, double q,
-        std::vector<double>& chi2_out
+        std::vector<double>& chi2_out,
+        double fs_bound = 1e300, double fb_offset = 0.0
     ) {
         int n = (int)results.size();
         chi2_out.resize(n);
@@ -77,25 +96,66 @@ public:
 
         if (n_threads <= 1 || n < n_threads) {
             for (int i = 0; i < n; i++) {
-                CompletedFit cf = kampylos_complete_candidate(vbms_[0], results[i], points[i], data, s, q);
+                CompletedFit cf = kampylos_complete_candidate(vbms_[0], results[i], points[i], data, s, q, fs_bound, fb_offset);
                 chi2_out[i] = cf.chi2;
             }
             return;
         }
 
-        std::vector<std::thread> workers;
-        workers.reserve(n_threads);
-        for (int t = 0; t < n_threads; t++) {
-            workers.emplace_back([this, t, n_threads, n, &results, &points, data, s, q, &chi2_out]() {
-                for (int i = t; i < n; i += n_threads) {
-                    CompletedFit cf = kampylos_complete_candidate(vbms_[t], results[i], points[i], data, s, q);
-                    chi2_out[i] = cf.chi2;
-                }
-            });
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            job_ = Job{ &results, &points, data, s, q, &chi2_out, fs_bound, fb_offset, n, n_threads };
+            pending_ = n_threads - 1;
+            generation_++;
         }
-        for (auto& w : workers) w.join();
+        start_cv_.notify_all();
+        run_share(0, job_);
+        std::unique_lock<std::mutex> lk(mu_);
+        done_cv_.wait(lk, [this]() { return pending_ == 0; });
     }
 
 private:
+    struct Job {
+        const std::vector<CandidateResult>* results;
+        const std::vector<Candidate>* points;
+        const LightCurvePoint* data;
+        double s, q;
+        std::vector<double>* chi2_out;
+        double fs_bound, fb_offset;
+        int n, n_threads;
+    };
+
+    void run_share(int t, const Job& j) {
+        for (int i = t; i < j.n; i += j.n_threads) {
+            CompletedFit cf = kampylos_complete_candidate(vbms_[t], (*j.results)[i], (*j.points)[i], j.data, j.s, j.q,
+                                                          j.fs_bound, j.fb_offset);
+            (*j.chi2_out)[i] = cf.chi2;
+        }
+    }
+
+    void worker_loop(int t) {
+        unsigned long long seen = 0;
+        for (;;) {
+            Job j;
+            {
+                std::unique_lock<std::mutex> lk(mu_);
+                start_cv_.wait(lk, [this, seen]() { return generation_ != seen; });
+                seen = generation_;
+                j = job_;
+            }
+            run_share(t, j);
+            {
+                std::lock_guard<std::mutex> lk(mu_);
+                if (--pending_ == 0) done_cv_.notify_one();
+            }
+        }
+    }
+
     std::vector<VBMicrolensing> vbms_;
+    std::vector<std::thread> workers_;
+    std::mutex mu_;
+    std::condition_variable start_cv_, done_cv_;
+    unsigned long long generation_ = 0;
+    int pending_ = 0;
+    Job job_{};
 };

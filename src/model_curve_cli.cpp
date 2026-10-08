@@ -5,6 +5,10 @@
 // chi2 number). Kept as a separate CLI rather than linked into the PHP process directly since
 // VBMicrolensing is a C++ library with no PHP binding -- PHP shells out to this, same pattern as
 // every other "real physics needs real C++" boundary in this project.
+//
+// log_s/log_q are NATURAL logs (VBMicrolensing's convention). Kampylos results files from
+// log10-grid work units (format 2, "# grid=log10") store log10 values -- the caller
+// (kampylos_lightcurve.php) converts them, multiplying by ln(10), before calling this.
 #include <cstdio>
 #include <cmath>
 #include "VBMicrolensingLibrary.h"

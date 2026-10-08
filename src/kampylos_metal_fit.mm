@@ -37,6 +37,8 @@
 #include "kampylos_metal_fit.h"
 #include "nelder_mead_stepper.h"
 #include "binary_fit.h"
+#include "kampylos_batched_fit.h"
+#include <algorithm>
 
 static const char *kKampylosMSLSource = R"MSL(
 #include <metal_stdlib>
@@ -337,8 +339,8 @@ inline void kahan_add(thread float& sum, thread float& c, float value) {
 kernel void kampylos_eval_candidates(
     device const LightCurvePointMSL* data [[buffer(0)]],
     constant int& n_points [[buffer(1)]],
-    constant float& log_s [[buffer(2)]],
-    constant float& log_q [[buffer(3)]],
+    constant float& s [[buffer(2)]],   // LINEAR separation / mass ratio (2026-10-08)
+    constant float& q [[buffer(3)]],
     device const CandidateMSL* candidates [[buffer(4)]],
     constant int& n_candidates [[buffer(5)]],
     device CandidateResultMSL* results [[buffer(6)]],
@@ -370,7 +372,6 @@ kernel void kampylos_eval_candidates(
         return;
     }
 
-    float s = exp(log_s), q = exp(log_q);
     float salpha = sin(c.alpha), calpha = cos(c.alpha);
     float tE_inv = 1.0 / tE;
 
@@ -476,6 +477,13 @@ struct CandidateResultMSL {
 // (double-based, shared with every other backend) gets its fields promoted back from this
 // kernel's float output before the CPU-side completion step runs.
 struct MetalFitImpl {
+    // 2026-10-08: times are uploaded RELATIVE to t_ref (and candidate t0 likewise). They used to
+    // be raw HJD (~2.45e6) cast to float, whose resolution there is 0.25 day -- every
+    // (t - t0) the kernel formed was quantised to 6 hours, far coarser than a planetary anomaly.
+    // Relative to the light curve's median time the resolution is ~1e-4 day over a decade-long
+    // baseline. Fluxes are centred (kampylos_flux_offset) to keep the float chi2 identity sane.
+    std::vector<LightCurvePoint> h_data;  // double, original t, centred flux
+    double t_ref = 0.0, flux_offset = 0.0, fs_bound = 1e300;
     id<MTLDevice> device = nil;
     id<MTLCommandQueue> queue = nil;
     id<MTLComputePipelineState> pipeline = nil;
@@ -520,9 +528,20 @@ bool metal_fit_select_device(MetalFitContext& ctx, std::string* err_out) {
 
 void metal_fit_upload_light_curve(MetalFitContext& ctx, const std::vector<DataPoint>& data) {
     MetalFitImpl* m = (MetalFitImpl*)ctx.impl;
+    std::vector<double> ts;
+    ts.reserve(data.size());
+    for (const auto& d : data) ts.push_back(d.t);
+    std::sort(ts.begin(), ts.end());
+    m->t_ref = ts.empty() ? 0.0 : ts[ts.size() / 2];
+    m->flux_offset = kampylos_flux_offset(data);
+    m->fs_bound = flux_fit_bound(data);
+    m->h_data.resize(data.size());
     std::vector<LightCurvePointMSL> h_data(data.size());
     for (size_t i = 0; i < data.size(); i++) {
-        h_data[i].t = (float)data[i].t; h_data[i].flux = (float)data[i].flux; h_data[i].sigma = (float)data[i].sigma;
+        m->h_data[i] = { data[i].t, data[i].flux - m->flux_offset, data[i].sigma };
+        h_data[i].t = (float)(data[i].t - m->t_ref);
+        h_data[i].flux = (float)(data[i].flux - m->flux_offset);
+        h_data[i].sigma = (float)data[i].sigma;
     }
     m->n_points = (int)h_data.size();
     m->buf_data = [m->device newBufferWithBytes:h_data.data()
@@ -538,9 +557,7 @@ static void ensure_cand_capacity(MetalFitImpl* m, int n) {
 }
 
 static std::vector<double> metal_eval_batch(
-    MetalFitContext& ctx, VBMicrolensing& vbm,
-    double log_s, double log_q, double s, double q,
-    const std::vector<LightCurvePoint>& h_data,
+    MetalFitContext& ctx, double s, double q,
     const std::vector<Candidate>& points
 ) {
     MetalFitImpl* m = (MetalFitImpl*)ctx.impl;
@@ -551,21 +568,21 @@ static std::vector<double> metal_eval_batch(
     ensure_cand_capacity(m, n);
     std::vector<CandidateMSL> h_cand(n);
     for (int i = 0; i < n; i++) {
-        h_cand[i].t0 = (float)points[i].t0; h_cand[i].u0 = (float)points[i].u0;
+        h_cand[i].t0 = (float)(points[i].t0 - m->t_ref); h_cand[i].u0 = (float)points[i].u0;
         h_cand[i].log_tE = (float)points[i].log_tE; h_cand[i].alpha = (float)points[i].alpha;
         h_cand[i].log_rho = (float)points[i].log_rho;
     }
     memcpy([m->buf_cand contents], h_cand.data(), n * sizeof(CandidateMSL));
 
-    float log_s_f = (float)log_s, log_q_f = (float)log_q;
+    float s_f = (float)s, q_f = (float)q;
 
     id<MTLCommandBuffer> cmdbuf = [m->queue commandBuffer];
     id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
     [enc setComputePipelineState:m->pipeline];
     [enc setBuffer:m->buf_data offset:0 atIndex:0];
     [enc setBytes:&m->n_points length:sizeof(int) atIndex:1];
-    [enc setBytes:&log_s_f length:sizeof(float) atIndex:2];
-    [enc setBytes:&log_q_f length:sizeof(float) atIndex:3];
+    [enc setBytes:&s_f length:sizeof(float) atIndex:2];
+    [enc setBytes:&q_f length:sizeof(float) atIndex:3];
     [enc setBuffer:m->buf_cand offset:0 atIndex:4];
     [enc setBytes:&n length:sizeof(int) atIndex:5];
     [enc setBuffer:m->buf_res offset:0 atIndex:6];
@@ -597,59 +614,23 @@ static std::vector<double> metal_eval_batch(
     // Same fix as gpu_fit_binary.cu's own gpu_eval_batch() (see that file and
     // kampylos_cpu_patch_pool.h for the full story) -- this was the same single-threaded
     // bottleneck for a pathological anchor, now spread across a small worker-thread pool instead.
-    (void)vbm;
-    static KampylosCpuPatchPool patch_pool(4);
-    patch_pool.complete_batch(results, points, h_data.data(), s, q, chi2);
+    // Created once, never destroyed: see kampylos_cpu_patch_pool.h (persistent workers).
+    static KampylosCpuPatchPool& patch_pool = *new KampylosCpuPatchPool(4);
+    patch_pool.complete_batch(results, points, m->h_data.data(), s, q, chi2, m->fs_bound, m->flux_offset);
     return chi2;
 }
 
-static Candidate to_candidate(const std::vector<double>& x) {
-    Candidate c;
-    c.t0 = x[0]; c.u0 = x[1]; c.log_tE = x[2]; c.alpha = x[3]; c.log_rho = x[4];
-    return c;
-}
-
-static std::vector<SimplexResultLite> metal_batched_nelder_mead(
-    MetalFitContext& ctx, VBMicrolensing& vbm,
-    double log_s, double log_q, double s, double q,
-    const std::vector<LightCurvePoint>& h_data,
-    const std::vector<std::vector<double>>& x0s,
-    const std::vector<std::vector<double>>& steps,
-    int max_iter, double ftol, double xtol
+BinaryFitResult metal_fit_binary_seeds(
+    MetalFitContext& ctx,
+    const std::vector<DataPoint>& data,
+    double ln_s, double ln_q,
+    const BinarySeedSet& seeds,
+    int n_restarts
 ) {
-    int n_seeds = (int)x0s.size();
-    std::vector<NelderMeadStepper> steppers;
-    steppers.reserve(n_seeds);
-    for (int i = 0; i < n_seeds; i++) steppers.emplace_back(x0s[i], steps[i], max_iter, ftol, xtol);
-
-    for (;;) {
-        std::vector<Candidate> batch;
-        std::vector<int> pending_count(n_seeds, 0);
-        bool any_active = false;
-        for (int s_i = 0; s_i < n_seeds; s_i++) {
-            if (steppers[s_i].done()) continue;
-            any_active = true;
-            const auto& pts = steppers[s_i].pending_points();
-            pending_count[s_i] = (int)pts.size();
-            for (const auto& p : pts) batch.push_back(to_candidate(p));
-        }
-        if (!any_active) break;
-
-        std::vector<double> chi2 = metal_eval_batch(ctx, vbm, log_s, log_q, s, q, h_data, batch);
-
-        int offset = 0;
-        for (int s_i = 0; s_i < n_seeds; s_i++) {
-            if (pending_count[s_i] == 0) continue;
-            std::vector<double> sub(chi2.begin() + offset, chi2.begin() + offset + pending_count[s_i]);
-            offset += pending_count[s_i];
-            steppers[s_i].submit_results(sub);
-        }
-    }
-
-    std::vector<SimplexResultLite> out;
-    out.reserve(n_seeds);
-    for (auto& st : steppers) out.push_back(st.result());
-    return out;
+    (void)data;
+    double s = exp(ln_s), q = exp(ln_q);
+    auto eval = [&](const std::vector<Candidate>& batch) { return metal_eval_batch(ctx, s, q, batch); };
+    return kampylos_batched_fit_seeds(eval, ln_s, ln_q, seeds, n_restarts);
 }
 
 BinaryFitResult metal_fit_binary_multistart(
@@ -662,50 +643,10 @@ BinaryFitResult metal_fit_binary_multistart(
     int n_alpha_seeds,
     int n_restarts
 ) {
-    std::vector<LightCurvePoint> h_data(data.size());
-    for (size_t i = 0; i < data.size(); i++) h_data[i] = { data[i].t, data[i].flux, data[i].sigma };
-    double s = exp(log_s), q = exp(log_q);
-
-    const double rho_seeds[] = { rho_seed, 1e-4, 1e-2 };
-    const double u0_mag_seeds[] = { fabs(u0_anchor), 0.02 };
-
-    std::vector<std::vector<double>> x0s, steps;
-    for (int i = 0; i < n_alpha_seeds; i++) {
-        double alpha_seed = 2.0 * M_PI * i / n_alpha_seeds;
-        for (double u0_mag : u0_mag_seeds) {
-            for (double u0_sign : { 1.0, -1.0 }) {
-                for (double rs : rho_seeds) {
-                    x0s.push_back({ t0_anchor, u0_sign * u0_mag, log(tE_anchor), alpha_seed, log(rs) });
-                    steps.push_back({ std::max(0.5, tE_anchor * 0.05), 0.05, 0.2, 0.3, 0.5 });
-                }
-            }
-        }
-    }
-
-    auto pass1 = metal_batched_nelder_mead(ctx, vbm, log_s, log_q, s, q, h_data, x0s, steps, 400, 1e-9, 1e-8);
-
-    std::vector<SimplexResultLite> current = pass1;
-    for (int restart = 0; restart < n_restarts; restart++) {
-        std::vector<std::vector<double>> rx0, rsteps;
-        for (auto& r : current) {
-            rx0.push_back(r.x);
-            rsteps.push_back({ 0.3, 0.02, 0.08, 0.15, 0.2 });
-        }
-        auto next = metal_batched_nelder_mead(ctx, vbm, log_s, log_q, s, q, h_data, rx0, rsteps, 400, 1e-10, 1e-9);
-        for (size_t i = 0; i < current.size(); i++) {
-            if (next[i].fval < current[i].fval) current[i] = next[i];
-        }
-    }
-
-    int best = 0;
-    for (size_t i = 1; i < current.size(); i++) if (current[i].fval < current[best].fval) best = (int)i;
-
-    BinaryFitResult out;
-    out.log_s = log_s; out.log_q = log_q;
-    out.t0 = current[best].x[0]; out.u0 = current[best].x[1]; out.tE = exp(current[best].x[2]);
-    out.alpha = current[best].x[3]; out.rho = exp(current[best].x[4]);
-    out.chi2 = current[best].fval;
-
+    MetalFitImpl* m = (MetalFitImpl*)ctx.impl;
+    if (m->n_points != (int)data.size()) metal_fit_upload_light_curve(ctx, data);
+    BinarySeedSet seeds = kampylos_legacy_multistart_seeds(t0_anchor, u0_anchor, tE_anchor, rho_seed, n_alpha_seeds);
+    BinaryFitResult out = metal_fit_binary_seeds(ctx, data, log_s, log_q, seeds, n_restarts);
     std::vector<double> mag(data.size());
     double pr[7] = { log_s, log_q, out.u0, out.alpha, log(out.rho), log(out.tE), out.t0 };
     for (size_t i = 0; i < data.size(); i++) mag[i] = vbm.BinaryLightCurve(pr, data[i].t);

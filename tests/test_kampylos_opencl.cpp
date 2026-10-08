@@ -140,8 +140,9 @@ int main() {
     size_t sh_bytes = 7 * local_size * sizeof(double);
     CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem), &d_data));
     CL_CHECK(clSetKernelArg(kernel, 1, sizeof(int), &n_points));
-    CL_CHECK(clSetKernelArg(kernel, 2, sizeof(double), &true_log_s));
-    CL_CHECK(clSetKernelArg(kernel, 3, sizeof(double), &true_log_q));
+    const double lin_s = exp(true_log_s), lin_q = exp(true_log_q); // kernel takes linear s, q
+    CL_CHECK(clSetKernelArg(kernel, 2, sizeof(double), &lin_s));
+    CL_CHECK(clSetKernelArg(kernel, 3, sizeof(double), &lin_q));
     CL_CHECK(clSetKernelArg(kernel, 4, sizeof(cl_mem), &d_cand));
     CL_CHECK(clSetKernelArg(kernel, 5, sizeof(int), &n_cand));
     CL_CHECK(clSetKernelArg(kernel, 6, sizeof(cl_mem), &d_res));

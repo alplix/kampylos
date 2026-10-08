@@ -8,6 +8,7 @@
 #include <cmath>
 #include <algorithm>
 #include "kampylos_gpu_types.h"
+#include "lightcurve.h" // flux_fit_solve(): the one fs/fb solve shared with the CPU path
 #include "VBMicrolensingLibrary.h"
 
 struct CompletedFit {
@@ -22,7 +23,10 @@ inline CompletedFit kampylos_complete_candidate(
     const CandidateResult& r,
     const Candidate& c,
     const LightCurvePoint* data,
-    double s, double q
+    double s, double q,
+    double fs_bound = 1e300,   // flux_fit_bound() of the light curve (backstop, see lightcurve.h)
+    double fb_offset = 0.0     // constant subtracted from every flux before upload (GPU paths
+                               // centre the light curve -- see gpu_upload_light_curve())
 ) {
     CompletedFit out;
     if (r.poisoned || r.overflow) {
@@ -61,38 +65,20 @@ inline CompletedFit kampylos_complete_candidate(
         S_yy += w * flux * flux;
     }
 
-    // Same ridge regularization as lightcurve.h's linear_flux_fit() -- this is a SEPARATE
-    // reimplementation of the same closed-form fs/fb solve (needed here since the GPU's partial
-    // sums arrive already split from the CPU-patched bad-point sums, not through that function).
-    // Each diagonal entry is damped relative to ITS OWN magnitude (not a shared lambda tied only
-    // to S_11), since S_AA scales like A^2 while S_11 doesn't scale with A at all -- a shared,
-    // S_11-only lambda is negligible next to S_AA for a high-magnification trial (common right
-    // near a caustic) and leaves that entry effectively unregularized. See lightcurve.h for the
-    // full analysis (confirmed directly: even the first, S_11-only version of this fix still let
-    // the GPU backend report fs/fb in the hundreds of thousands for exactly this kind of trial).
-    double eps_reg = 1e-2;
-    double S_AA_r = S_AA * (1.0 + eps_reg), S_11_r = S_11 * (1.0 + eps_reg);
-    double det = S_AA_r * S_11_r - S_A1 * S_A1;
-    double fs = (S_11_r * S_Ay - S_A1 * S_1y) / det;
-    double fb = (S_AA_r * S_1y - S_A1 * S_Ay) / det;
-    // Same second line of defense as lightcurve.h's linear_flux_fit(): proportional
-    // regularization alone isn't a complete fix (in the exactly-constant-A limit, the eps term
-    // cancels out of fs/fb algebraically, leaving a value set by data noise alone -- confirmed
-    // directly, a trial with tE far beyond the data span still produced fs/fb in the tens of
-    // thousands even with the regularization above in place). A real fit's fs/fb are flux
-    // contributions in the same units as the data, so they can't legitimately run far past the
-    // data's own scale. No per-point flux array here (this function only ever sees the kernel's
-    // running sums plus the few patched bad points), so the scale is estimated from the sums
-    // already at hand: sqrt(S_yy/S_11) is the weighted RMS flux, cheap and good enough as an
-    // order-of-magnitude bound without a second pass over the light curve.
-    double flux_scale = std::sqrt(std::max(S_yy / std::max(S_11, 1e-300), 1e-300));
-    double fs_bound = 1e3 * std::max(flux_scale, 1e-12);
-    if (std::fabs(fs) > fs_bound || std::fabs(fb) > fs_bound) {
-        fs = 0;
-        fb = S_11 > 0 ? S_1y / S_11 : 0;
-    }
-    // chi2 = S_yy - fs*S_Ay - fb*S_1y (see kampylos_gpu_kernel.cu's top comment for the identity).
-    out.chi2 = S_yy - fs * S_Ay - fb * S_1y;
+    // The closed-form fs/fb solve is lightcurve.h's flux_fit_solve() -- the SAME function the
+    // CPU path uses (2026-10-08: this used to be a separate copy of the old eps_reg=1e-2 ridge
+    // solve, which biased chi2 upward by hundreds to thousands; see lightcurve.h). The data
+    // arrive flux-centred (flux - fb_offset), which leaves fs and chi2 unchanged and shifts fb
+    // by -fb_offset; the backstop test is applied to the uncentred fb so it trips exactly where
+    // the CPU path's does (flux_fit_solve's fb_offset argument).
+    FluxFit ff = flux_fit_solve(S_AA, S_A1, S_11, S_Ay, S_1y, fs_bound, fb_offset);
+    double fs = ff.fs, fb = ff.fb;
+    // chi2 = S_yy - fs*S_Ay - fb*S_1y (see kampylos_gpu_kernel.cu's top comment for the identity
+    // -- valid at the exact least-squares fs/fb; for the rare tiny-ridge/backstop cases the
+    // general quadratic form below is used instead, which is exact for ANY fs/fb).
+    out.chi2 = (ff.degenerate == 0)
+        ? S_yy - fs * S_Ay - fb * S_1y
+        : S_yy - 2.0 * fs * S_Ay - 2.0 * fb * S_1y + fs * fs * S_AA + 2.0 * fs * fb * S_A1 + fb * fb * S_11;
     out.fs = fs;
     out.fb = fb;
     out.dead = false;

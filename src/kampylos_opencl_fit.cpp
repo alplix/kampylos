@@ -20,6 +20,7 @@
 #include "kampylos_cpu_patch_pool.h"
 #include "kampylos_opencl_fit.h"
 #include "nelder_mead_stepper.h"
+#include "kampylos_batched_fit.h"
 #include "kampylos_cl_embedded.h"
 
 // 2026-10-06, forum thread 64 ("Intel GPU tasks run on Nvidia") -- see opencl_search.c's
@@ -114,13 +115,16 @@ bool opencl_fit_select_device(OpenCLFitContext& ctx, int device_id, std::string*
 }
 
 void opencl_fit_upload_light_curve(OpenCLFitContext& ctx, const std::vector<DataPoint>& data) {
-    std::vector<LightCurvePoint> h_data(data.size());
-    for (size_t i = 0; i < data.size(); i++) h_data[i] = { data[i].t, data[i].flux, data[i].sigma };
-    ctx.n_points = (int)h_data.size();
+    // Flux-centred, same as gpu_upload_light_curve() (see kampylos_flux_offset()).
+    ctx.flux_offset = kampylos_flux_offset(data);
+    ctx.fs_bound = flux_fit_bound(data);
+    ctx.h_data.resize(data.size());
+    for (size_t i = 0; i < data.size(); i++) ctx.h_data[i] = { data[i].t, data[i].flux - ctx.flux_offset, data[i].sigma };
+    ctx.n_points = (int)ctx.h_data.size();
     if (ctx.d_data) cl_api.ReleaseMemObject(ctx.d_data);
     cl_int err;
     ctx.d_data = cl_api.CreateBuffer(ctx.context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
-        h_data.size() * sizeof(LightCurvePoint), h_data.data(), &err);
+        ctx.h_data.size() * sizeof(LightCurvePoint), ctx.h_data.data(), &err);
 }
 
 static void ensure_cand_capacity(OpenCLFitContext& ctx, int n) {
@@ -134,9 +138,7 @@ static void ensure_cand_capacity(OpenCLFitContext& ctx, int n) {
 }
 
 static std::vector<double> opencl_eval_batch(
-    OpenCLFitContext& ctx, VBMicrolensing& vbm,
-    double log_s, double log_q, double s, double q,
-    const std::vector<LightCurvePoint>& h_data,
+    OpenCLFitContext& ctx, double s, double q,
     const std::vector<Candidate>& points
 ) {
     int n = (int)points.size();
@@ -150,8 +152,8 @@ static std::vector<double> opencl_eval_batch(
     size_t sh_bytes = 7 * local_size * sizeof(double);
     cl_api.SetKernelArg(ctx.kernel, 0, sizeof(cl_mem), &ctx.d_data);
     cl_api.SetKernelArg(ctx.kernel, 1, sizeof(int), &ctx.n_points);
-    cl_api.SetKernelArg(ctx.kernel, 2, sizeof(double), &log_s);
-    cl_api.SetKernelArg(ctx.kernel, 3, sizeof(double), &log_q);
+    cl_api.SetKernelArg(ctx.kernel, 2, sizeof(double), &s);   // linear s, q (2026-10-08)
+    cl_api.SetKernelArg(ctx.kernel, 3, sizeof(double), &q);
     cl_api.SetKernelArg(ctx.kernel, 4, sizeof(cl_mem), &ctx.d_cand);
     cl_api.SetKernelArg(ctx.kernel, 5, sizeof(int), &n);
     cl_api.SetKernelArg(ctx.kernel, 6, sizeof(cl_mem), &ctx.d_res);
@@ -170,59 +172,23 @@ static std::vector<double> opencl_eval_batch(
     // Same fix as gpu_fit_binary.cu's own gpu_eval_batch() (see that file and
     // kampylos_cpu_patch_pool.h for the full story) -- this loop was the same single-threaded
     // bottleneck for a pathological anchor, now spread across a small worker-thread pool instead.
-    (void)vbm;
-    static KampylosCpuPatchPool patch_pool(4);
-    patch_pool.complete_batch(h_res, points, h_data.data(), s, q, chi2);
+    // Created once, never destroyed: see kampylos_cpu_patch_pool.h (persistent workers).
+    static KampylosCpuPatchPool& patch_pool = *new KampylosCpuPatchPool(4);
+    patch_pool.complete_batch(h_res, points, ctx.h_data.data(), s, q, chi2, ctx.fs_bound, ctx.flux_offset);
     return chi2;
 }
 
-static Candidate to_candidate(const std::vector<double>& x) {
-    Candidate c;
-    c.t0 = x[0]; c.u0 = x[1]; c.log_tE = x[2]; c.alpha = x[3]; c.log_rho = x[4];
-    return c;
-}
-
-static std::vector<SimplexResultLite> opencl_batched_nelder_mead(
-    OpenCLFitContext& ctx, VBMicrolensing& vbm,
-    double log_s, double log_q, double s, double q,
-    const std::vector<LightCurvePoint>& h_data,
-    const std::vector<std::vector<double>>& x0s,
-    const std::vector<std::vector<double>>& steps,
-    int max_iter, double ftol, double xtol
+BinaryFitResult opencl_fit_binary_seeds(
+    OpenCLFitContext& ctx,
+    const std::vector<DataPoint>& data,
+    double ln_s, double ln_q,
+    const BinarySeedSet& seeds,
+    int n_restarts
 ) {
-    int n_seeds = (int)x0s.size();
-    std::vector<NelderMeadStepper> steppers;
-    steppers.reserve(n_seeds);
-    for (int i = 0; i < n_seeds; i++) steppers.emplace_back(x0s[i], steps[i], max_iter, ftol, xtol);
-
-    for (;;) {
-        std::vector<Candidate> batch;
-        std::vector<int> pending_count(n_seeds, 0);
-        bool any_active = false;
-        for (int s_i = 0; s_i < n_seeds; s_i++) {
-            if (steppers[s_i].done()) continue;
-            any_active = true;
-            const auto& pts = steppers[s_i].pending_points();
-            pending_count[s_i] = (int)pts.size();
-            for (const auto& p : pts) batch.push_back(to_candidate(p));
-        }
-        if (!any_active) break;
-
-        std::vector<double> chi2 = opencl_eval_batch(ctx, vbm, log_s, log_q, s, q, h_data, batch);
-
-        int offset = 0;
-        for (int s_i = 0; s_i < n_seeds; s_i++) {
-            if (pending_count[s_i] == 0) continue;
-            std::vector<double> sub(chi2.begin() + offset, chi2.begin() + offset + pending_count[s_i]);
-            offset += pending_count[s_i];
-            steppers[s_i].submit_results(sub);
-        }
-    }
-
-    std::vector<SimplexResultLite> out;
-    out.reserve(n_seeds);
-    for (auto& st : steppers) out.push_back(st.result());
-    return out;
+    (void)data;
+    double s = exp(ln_s), q = exp(ln_q);
+    auto eval = [&](const std::vector<Candidate>& batch) { return opencl_eval_batch(ctx, s, q, batch); };
+    return kampylos_batched_fit_seeds(eval, ln_s, ln_q, seeds, n_restarts);
 }
 
 BinaryFitResult opencl_fit_binary_multistart(
@@ -235,50 +201,9 @@ BinaryFitResult opencl_fit_binary_multistart(
     int n_alpha_seeds,
     int n_restarts
 ) {
-    std::vector<LightCurvePoint> h_data(data.size());
-    for (size_t i = 0; i < data.size(); i++) h_data[i] = { data[i].t, data[i].flux, data[i].sigma };
-    double s = exp(log_s), q = exp(log_q);
-
-    const double rho_seeds[] = { rho_seed, 1e-4, 1e-2 };
-    const double u0_mag_seeds[] = { fabs(u0_anchor), 0.02 };
-
-    std::vector<std::vector<double>> x0s, steps;
-    for (int i = 0; i < n_alpha_seeds; i++) {
-        double alpha_seed = 2.0 * M_PI * i / n_alpha_seeds;
-        for (double u0_mag : u0_mag_seeds) {
-            for (double u0_sign : { 1.0, -1.0 }) {
-                for (double rs : rho_seeds) {
-                    x0s.push_back({ t0_anchor, u0_sign * u0_mag, log(tE_anchor), alpha_seed, log(rs) });
-                    steps.push_back({ std::max(0.5, tE_anchor * 0.05), 0.05, 0.2, 0.3, 0.5 });
-                }
-            }
-        }
-    }
-
-    auto pass1 = opencl_batched_nelder_mead(ctx, vbm, log_s, log_q, s, q, h_data, x0s, steps, 400, 1e-9, 1e-8);
-
-    std::vector<SimplexResultLite> current = pass1;
-    for (int restart = 0; restart < n_restarts; restart++) {
-        std::vector<std::vector<double>> rx0, rsteps;
-        for (auto& r : current) {
-            rx0.push_back(r.x);
-            rsteps.push_back({ 0.3, 0.02, 0.08, 0.15, 0.2 });
-        }
-        auto next = opencl_batched_nelder_mead(ctx, vbm, log_s, log_q, s, q, h_data, rx0, rsteps, 400, 1e-10, 1e-9);
-        for (size_t i = 0; i < current.size(); i++) {
-            if (next[i].fval < current[i].fval) current[i] = next[i];
-        }
-    }
-
-    int best = 0;
-    for (size_t i = 1; i < current.size(); i++) if (current[i].fval < current[best].fval) best = (int)i;
-
-    BinaryFitResult out;
-    out.log_s = log_s; out.log_q = log_q;
-    out.t0 = current[best].x[0]; out.u0 = current[best].x[1]; out.tE = exp(current[best].x[2]);
-    out.alpha = current[best].x[3]; out.rho = exp(current[best].x[4]);
-    out.chi2 = current[best].fval;
-
+    if (ctx.n_points != (int)data.size()) opencl_fit_upload_light_curve(ctx, data);
+    BinarySeedSet seeds = kampylos_legacy_multistart_seeds(t0_anchor, u0_anchor, tE_anchor, rho_seed, n_alpha_seeds);
+    BinaryFitResult out = opencl_fit_binary_seeds(ctx, data, log_s, log_q, seeds, n_restarts);
     std::vector<double> mag(data.size());
     double pr[7] = { log_s, log_q, out.u0, out.alpha, log(out.rho), log(out.tE), out.t0 };
     for (size_t i = 0; i < data.size(); i++) mag[i] = vbm.BinaryLightCurve(pr, data[i].t);

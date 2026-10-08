@@ -53,9 +53,12 @@ __device__ void block_reduce(double* sh) {
     }
 }
 
+// s, q are LINEAR separation and mass ratio (2026-10-08: the kernel used to take log_s/log_q
+// and exp() them itself, which baked the natural-log grid convention into the GPU code; the
+// host now converts once per cell from whichever convention the work unit uses).
 extern "C" __global__ void kampylos_eval_candidates(
     const LightCurvePoint* data, int n_points,
-    double log_s, double log_q,
+    double s, double q,
     const Candidate* candidates, int n_candidates,
     CandidateResult* results
 ) {
@@ -86,7 +89,6 @@ extern "C" __global__ void kampylos_eval_candidates(
         return;
     }
 
-    double s = exp(log_s), q = exp(log_q);
     double salpha = sin(c.alpha), calpha = cos(c.alpha);
     double tE_inv = 1.0 / tE;
 
