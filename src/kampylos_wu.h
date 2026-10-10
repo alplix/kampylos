@@ -8,12 +8,19 @@
 // byte-compatible result files that the server can parse with one parser.
 //
 // ---- Input ("in" file), one line ---------------------------------------------------------
-//   <mag|flux> <s_min> <s_max> <n_s> <q_min> <q_max> <n_q> [log10|ln]
+//   <mag|flux> <s_min> <s_max> <n_s> <q_min> <q_max> <n_q> [log10|ln] [part <i> <K>]
 // The optional 8th token is the GRID CONVENTION MARKER (added 2026-10-08):
 //   * "log10": the grid values are log10(s), log10(q).
 //   * absent (every WU created before 2026-10-08) or "ln": natural logs -- the historical
 //     behaviour, kept so the thousands of already-queued WUs mean what they always meant.
 // Any other trailing token is rejected (better a hard error than silently guessing).
+// The optional trailing "part <i> <K>" (added 2026-10-10, CPU app v12) splits every cell's seed set
+// over K work units: part i fits only the seeds whose index k satisfies k % K == i (interleaved, so
+// the parts cost about the same). Each part writes the normal one-line-per-cell result (best of ITS
+// seeds); the result files of the K parts are merged by keeping the lowest chi2 per cell, which is
+// exactly what kampylos_analyze.py's dedupe_cells() already did for re-issued work units. Absent =
+// part 0 of 1 = all seeds, the historical behaviour. Backends that cannot split (GPU) must reject
+// nparts > 1.
 // NOTE: binaries built before this change read the line with a fixed 7-field fscanf and
 // IGNORE the marker, i.e. they would run a log10 WU with ln semantics. Their result header is
 // the old one ("# log_s log_q chi2 ..."), which kampylos_validate.sh rejects for a log10 WU,
@@ -58,6 +65,7 @@ struct KampylosWuInput {
     double s_min = 0, s_max = 0, q_min = 0, q_max = 0;
     int n_s = 1, n_q = 1;
     bool log10_grid = false;   // false = natural log (legacy)
+    int part = 0, nparts = 1;  // seed split, see the "part" token above
 };
 
 inline const char* kampylos_grid_name(bool log10_grid) { return log10_grid ? "log10" : "ln"; }
@@ -84,8 +92,19 @@ inline bool kampylos_parse_input(const std::string& text, KampylosWuInput* in, s
             i = j;
         }
     }
+    // optional trailing "part <i> <K>"
+    in->part = 0; in->nparts = 1;
+    if (tok.size() >= 10 && tok[tok.size() - 3] == "part") {
+        char* pe = nullptr;
+        long pi = strtol(tok[tok.size() - 2].c_str(), &pe, 10);
+        if (!pe || *pe) { *err = "bad part index '" + tok[tok.size() - 2] + "'"; return false; }
+        long pk = strtol(tok[tok.size() - 1].c_str(), &pe, 10);
+        if (!pe || *pe || pk < 1 || pk > 64 || pi < 0 || pi >= pk) { *err = "bad part " + tok[tok.size() - 2] + " of " + tok[tok.size() - 1]; return false; }
+        in->part = (int)pi; in->nparts = (int)pk;
+        tok.resize(tok.size() - 3);
+    }
     if (tok.size() != 7 && tok.size() != 8) {
-        *err = "expected: mag|flux s_min s_max n_s q_min q_max n_q [log10|ln], got " + std::to_string(tok.size()) + " tokens";
+        *err = "expected: mag|flux s_min s_max n_s q_min q_max n_q [log10|ln] [part i K], got " + std::to_string(tok.size()) + " tokens";
         return false;
     }
     if (tok[0] != "mag" && tok[0] != "flux") { *err = "first token must be mag or flux, got '" + tok[0] + "'"; return false; }
