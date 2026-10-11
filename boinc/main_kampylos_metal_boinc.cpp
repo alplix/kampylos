@@ -20,7 +20,10 @@
 
 #include "kampylos_boinc_common.h"
 
+// Build with -DKAMPYLOS_METAL_VERSION='"N"' so the printed version matches the server's version_num.
+#ifndef KAMPYLOS_METAL_VERSION
 #define KAMPYLOS_METAL_VERSION "2"
+#endif
 
 int main(int argc, char **argv) {
     (void)argc; (void)argv;

@@ -288,19 +288,19 @@ void kampylos_run_cells(FILE* fout, FILE* log, const KampylosWuInput& in, const 
     }
 }
 
-// On a resumed run, cut the output file back to its header lines plus the first `keep_cells`
-// data lines, so a cell whose line was written but whose checkpoint was not is not duplicated.
-// Returns false if the file cannot be read back or does not start with the format-2 header
-// (the caller then restarts the WU from cell 0).
-inline bool kampylos_trim_output(const char* path, int keep_cells) {
+// Splits an existing result file into its header lines plus the first `keep_cells` complete
+// data lines (keep_cells < 0 = all of them). A trailing line without '\n' is a torn write from
+// an interrupted run and is dropped. Returns the number of complete data lines kept, or -1 if
+// the file cannot be read or does not start with the format-2 header.
+inline int kampylos_split_output(const char* path, int keep_cells, std::string* kept_out) {
     FILE* f = fopen(path, "rb");
-    if (!f) return false;
+    if (!f) return -1;
     std::string content, kept;
     char buf[4096];
     size_t n;
     while ((n = fread(buf, 1, sizeof(buf), f)) > 0) content.append(buf, n);
     fclose(f);
-    if (content.compare(0, 7, "# grid=") != 0) return false;
+    if (content.compare(0, 7, "# grid=") != 0) return -1;
     size_t pos = 0;
     int data_lines = 0;
     while (pos < content.size()) {
@@ -308,11 +308,29 @@ inline bool kampylos_trim_output(const char* path, int keep_cells) {
         if (eol == std::string::npos) break;           // drop a torn last line
         std::string line = content.substr(pos, eol - pos + 1);
         if (line[0] == '#') kept += line;
-        else if (data_lines < keep_cells) { kept += line; data_lines++; }
+        else if (keep_cells < 0 || data_lines < keep_cells) { kept += line; data_lines++; }
         pos = eol + 1;
     }
+    if (kept_out) *kept_out = kept;
+    return data_lines;
+}
+
+// Number of complete cell lines in a result file (-1: no usable file). The result file is the
+// authoritative record of finished cells: a line is only ever written after its cell completed,
+// so a resume can trust it even when the checkpoint file is missing or stale.
+inline int kampylos_count_complete_cells(const char* path) {
+    return kampylos_split_output(path, -1, nullptr);
+}
+
+// On a resumed run, cut the output file back to its header lines plus the first `keep_cells`
+// data lines, so a cell whose line was written but whose checkpoint was not is not duplicated.
+// Returns false if the file cannot be read back, does not start with the format-2 header, or
+// holds fewer than keep_cells complete lines (the caller then restarts the WU from cell 0).
+inline bool kampylos_trim_output(const char* path, int keep_cells) {
+    std::string kept;
+    int data_lines = kampylos_split_output(path, keep_cells, &kept);
     if (data_lines < keep_cells) return false;
-    f = fopen(path, "wb");
+    FILE* f = fopen(path, "wb");
     if (!f) return false;
     fwrite(kept.data(), 1, kept.size(), f);
     fclose(f);

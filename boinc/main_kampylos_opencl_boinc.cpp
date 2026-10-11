@@ -22,7 +22,10 @@
 
 #include "kampylos_boinc_common.h"
 
+// Build with -DKAMPYLOS_OPENCL_VERSION='"N"' so the printed version matches the server's version_num.
+#ifndef KAMPYLOS_OPENCL_VERSION
 #define KAMPYLOS_OPENCL_VERSION "2"
+#endif
 
 // BOINC hands GPU app_versions the device index via "--device N" on the command line -- same
 // convention as every GPU app in this project.
