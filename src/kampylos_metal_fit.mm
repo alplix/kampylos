@@ -26,6 +26,7 @@
 // completion step (metal_eval_batch, reusing kampylos_gpu_complete.h's existing double-based
 // CandidateResult by converting the float kernel output into it).
 #import <Metal/Metal.h>
+#include <unistd.h>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -322,7 +323,8 @@ struct CandidateMSL { float t0, u0, log_tE, alpha, log_rho; };
 
 #define KAMPYLOS_MSL_MAX_BAD_POINTS 512
 struct CandidateResultMSL {
-    float S_AA, S_A1, S_11, S_Ay, S_1y, S_yy;
+    float S_AA, S_A1, S_11, S_Ay, S_1y, S_yy;     // high halves of the double-single sums
+    float L_AA, L_A1, L_11, L_Ay, L_1y, L_yy;     // low halves: the host adds hi + lo in double
     int n_bad;
     int overflow;
     int bad_idx[KAMPYLOS_MSL_MAX_BAD_POINTS];
@@ -367,6 +369,7 @@ kernel void kampylos_eval_candidates(
         if (lid == 0) {
             device CandidateResultMSL& r = results[cand_idx];
             r.S_AA = r.S_A1 = r.S_11 = r.S_Ay = r.S_1y = r.S_yy = 0;
+            r.L_AA = r.L_A1 = r.L_11 = r.L_Ay = r.L_1y = r.L_yy = 0;
             r.n_bad = 0; r.overflow = 0; r.poisoned = 1;
         }
         return;
@@ -375,8 +378,11 @@ kernel void kampylos_eval_candidates(
     float salpha = sin(c.alpha), calpha = cos(c.alpha);
     float tE_inv = 1.0 / tE;
 
-    float S_AA = 0, S_A1 = 0, S_11 = 0, S_Ay = 0, S_1y = 0, S_yy = 0;
-    float c_AA = 0, c_A1 = 0, c_11 = 0, c_Ay = 0, c_1y = 0, c_yy = 0; // Kahan compensators
+    // 2026-10-10 (external review): the six sums are double-single ds values, products included. Float products
+    // (w*A*A is about 1e6 with 6e-8 relative error each) plus Kahan summation left a 0.1-0.4 chi2 objective noise
+    // that Nelder-Mead (ftol 1e-9) steered on, ending in the wrong basin; with ds products and sums the Metal chi2
+    // matches the CPU's to ~0.002.
+    ds S_AA = dsmake(0), S_A1 = dsmake(0), S_11 = dsmake(0), S_Ay = dsmake(0), S_1y = dsmake(0), S_yy = dsmake(0);
     float any_invalid = 0;
 
     for (int i = (int)lid; i < n_points; i += (int)lsize) {
@@ -404,21 +410,24 @@ kernel void kampylos_eval_candidates(
         float sigma = data[i].sigma;
         float w = 1.0 / (sigma * sigma);
         float flux = data[i].flux;
-        kahan_add(S_AA, c_AA, w * A * A);
-        kahan_add(S_A1, c_A1, w * A);
-        kahan_add(S_11, c_11, w);
-        kahan_add(S_Ay, c_Ay, w * A * flux);
-        kahan_add(S_1y, c_1y, w * flux);
-        kahan_add(S_yy, c_yy, w * flux * flux);
+        ds dw = dsmake(w), dA = dsmake(A), dy = dsmake(flux);
+        ds wA = ds_mul(dw, dA);
+        ds wy = ds_mul(dw, dy);
+        S_AA = ds_add(S_AA, ds_mul(wA, dA));
+        S_A1 = ds_add(S_A1, wA);
+        S_11 = ds_add(S_11, dw);
+        S_Ay = ds_add(S_Ay, ds_mul(wA, dy));
+        S_1y = ds_add(S_1y, wy);
+        S_yy = ds_add(S_yy, ds_mul(wy, dy));
     }
 
     int tid = (int)lid, ls = (int)lsize;
-    sh[0 * ls + tid] = S_AA;
-    sh[1 * ls + tid] = S_A1;
-    sh[2 * ls + tid] = S_11;
-    sh[3 * ls + tid] = S_Ay;
-    sh[4 * ls + tid] = S_1y;
-    sh[5 * ls + tid] = S_yy;
+    sh[0 * ls + tid] = S_AA.hi;  sh[7 * ls + tid] = S_AA.lo;
+    sh[1 * ls + tid] = S_A1.hi;  sh[8 * ls + tid] = S_A1.lo;
+    sh[2 * ls + tid] = S_11.hi;  sh[9 * ls + tid] = S_11.lo;
+    sh[3 * ls + tid] = S_Ay.hi;  sh[10 * ls + tid] = S_Ay.lo;
+    sh[4 * ls + tid] = S_1y.hi;  sh[11 * ls + tid] = S_1y.lo;
+    sh[5 * ls + tid] = S_yy.hi;  sh[12 * ls + tid] = S_yy.lo;
     sh[6 * ls + tid] = any_invalid;
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -428,7 +437,14 @@ kernel void kampylos_eval_candidates(
     // doesn't re-appear at this scale.
     for (uint stride = lsize / 2; stride > 0; stride >>= 1) {
         if (lid < stride) {
-            for (int k = 0; k < 7; k++) sh[k * ls + tid] += sh[k * ls + tid + (int)stride];
+            sh[6 * ls + tid] += sh[6 * ls + tid + (int)stride];
+            for (int k = 0; k < 6; k++) {
+                ds a = dsmake(sh[k * ls + tid], sh[(7 + k) * ls + tid]);
+                ds b = dsmake(sh[k * ls + tid + (int)stride], sh[(7 + k) * ls + tid + (int)stride]);
+                ds c2 = ds_add(a, b);
+                sh[k * ls + tid] = c2.hi;
+                sh[(7 + k) * ls + tid] = c2.lo;
+            }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
@@ -437,10 +453,13 @@ kernel void kampylos_eval_candidates(
         device CandidateResultMSL& r = results[cand_idx];
         if (sh[6 * ls] > 0) {
             r.S_AA = r.S_A1 = r.S_11 = r.S_Ay = r.S_1y = r.S_yy = 0;
+            r.L_AA = r.L_A1 = r.L_11 = r.L_Ay = r.L_1y = r.L_yy = 0;
             r.n_bad = 0; r.overflow = 0; r.poisoned = 1;
         } else {
             r.S_AA = sh[0 * ls]; r.S_A1 = sh[1 * ls]; r.S_11 = sh[2 * ls];
             r.S_Ay = sh[3 * ls]; r.S_1y = sh[4 * ls]; r.S_yy = sh[5 * ls];
+            r.L_AA = sh[7 * ls]; r.L_A1 = sh[8 * ls]; r.L_11 = sh[9 * ls];
+            r.L_Ay = sh[10 * ls]; r.L_1y = sh[11 * ls]; r.L_yy = sh[12 * ls];
             r.n_bad = min(atomic_load_explicit(bad_count, memory_order_relaxed), (int)KAMPYLOS_MSL_MAX_BAD_POINTS);
             r.overflow = atomic_load_explicit(overflow_flag, memory_order_relaxed);
             r.poisoned = 0;
@@ -458,7 +477,8 @@ struct LightCurvePointMSL { float t, flux, sigma; };
 struct CandidateMSL { float t0, u0, log_tE, alpha, log_rho; };
 #define KAMPYLOS_MSL_MAX_BAD_POINTS_HOST 512
 struct CandidateResultMSL {
-    float S_AA, S_A1, S_11, S_Ay, S_1y, S_yy;
+    float S_AA, S_A1, S_11, S_Ay, S_1y, S_yy;     // high halves of the double-single sums
+    float L_AA, L_A1, L_11, L_Ay, L_1y, L_yy;     // low halves: the host adds hi + lo in double
     int n_bad;
     int overflow;
     int bad_idx[KAMPYLOS_MSL_MAX_BAD_POINTS_HOST];
@@ -511,7 +531,12 @@ bool metal_fit_select_device(MetalFitContext& ctx, std::string* err_out) {
 
     NSError* error = nil;
     NSString* src = [NSString stringWithUTF8String:kKampylosMSLSource];
-    id<MTLLibrary> library = [m->device newLibraryWithSource:src options:nil error:&error];
+    // Fast math must be OFF: the default lets the compiler re-associate the error-free transformations the whole
+    // double-single layer rests on (lo = (a - (hi - bb)) + (b - bb), lo = fma(a, b, -hi)), silently degrading the kernel
+    // to plain float32 (every candidate then poisoned: chi2 of the true planet parameters 1e18 instead of 411.7).
+    MTLCompileOptions* opts = [[MTLCompileOptions alloc] init];
+    opts.fastMathEnabled = NO;
+    id<MTLLibrary> library = [m->device newLibraryWithSource:src options:opts error:&error];
     if (!library) {
         if (err_out) *err_out = std::string("MSL compile failed: ") + (error ? [[error localizedDescription] UTF8String] : "unknown");
         return false;
@@ -576,24 +601,47 @@ static std::vector<double> metal_eval_batch(
 
     float s_f = (float)s, q_f = (float)q;
 
-    id<MTLCommandBuffer> cmdbuf = [m->queue commandBuffer];
-    id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
-    [enc setComputePipelineState:m->pipeline];
-    [enc setBuffer:m->buf_data offset:0 atIndex:0];
-    [enc setBytes:&m->n_points length:sizeof(int) atIndex:1];
-    [enc setBytes:&s_f length:sizeof(float) atIndex:2];
-    [enc setBytes:&q_f length:sizeof(float) atIndex:3];
-    [enc setBuffer:m->buf_cand offset:0 atIndex:4];
-    [enc setBytes:&n length:sizeof(int) atIndex:5];
-    [enc setBuffer:m->buf_res offset:0 atIndex:6];
-    int local_size = 128;
-    [enc setThreadgroupMemoryLength:7 * local_size * sizeof(float) atIndex:0];
-    [enc setThreadgroupMemoryLength:sizeof(int) atIndex:1];
-    [enc setThreadgroupMemoryLength:sizeof(int) atIndex:2];
-    [enc dispatchThreadgroups:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(local_size, 1, 1)];
-    [enc endEncoding];
-    [cmdbuf commit];
-    [cmdbuf waitUntilCompleted];
+    // Chunks of at most `chunk` candidates per command buffer: a retry then costs little, and on a busy GPU (other
+    // Metal processes on the same Mac) short buffers are far less likely to be aborted by the driver (review 2026-10-10:
+    // "Internal Error (0000000e)" under contention; a 20k-point curve needs 3.4 s for 1440 candidates in one buffer).
+    int chunk = n;
+    if (m->n_points > 8000) chunk = 256;
+    else if (m->n_points > 2000) chunk = 512;
+    if (chunk > n) chunk = n;
+    for (int start = 0; start < n; start += chunk) {
+        int cn = std::min(chunk, n - start);
+        bool done = false;
+        for (int attempt = 0; attempt < 13 && !done; attempt++) {
+            id<MTLCommandBuffer> cmdbuf = [m->queue commandBuffer];
+            id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
+            [enc setComputePipelineState:m->pipeline];
+            [enc setBuffer:m->buf_data offset:0 atIndex:0];
+            [enc setBytes:&m->n_points length:sizeof(int) atIndex:1];
+            [enc setBytes:&s_f length:sizeof(float) atIndex:2];
+            [enc setBytes:&q_f length:sizeof(float) atIndex:3];
+            [enc setBuffer:m->buf_cand offset:(NSUInteger)start * sizeof(CandidateMSL) atIndex:4];
+            [enc setBytes:&cn length:sizeof(int) atIndex:5];
+            [enc setBuffer:m->buf_res offset:(NSUInteger)start * sizeof(CandidateResultMSL) atIndex:6];
+            int local_size = 128;
+            [enc setThreadgroupMemoryLength:13 * local_size * sizeof(float) atIndex:0];   // 6 hi + 6 lo + any_invalid
+            [enc setThreadgroupMemoryLength:16 atIndex:1];                               // Metal wants multiples of 16 bytes
+            [enc setThreadgroupMemoryLength:16 atIndex:2];
+            [enc dispatchThreadgroups:MTLSizeMake(cn, 1, 1) threadsPerThreadgroup:MTLSizeMake(local_size, 1, 1)];
+            [enc endEncoding];
+            [cmdbuf commit];
+            [cmdbuf waitUntilCompleted];
+            if (cmdbuf.status == MTLCommandBufferStatusCompleted && cmdbuf.error == nil) { done = true; break; }
+            // The kernel is pure (inputs are read-only, the result slots are rewritten), so re-submitting the same chunk is
+            // the right answer to a transient abort; never carry on with the stale result buffer.
+            fprintf(stderr, "metal_eval_batch: command buffer failed (status %ld, %s) -- chunk %d..%d, attempt %d\n",
+                    (long)cmdbuf.status, cmdbuf.error ? [[cmdbuf.error localizedDescription] UTF8String] : "no error object", start, start + cn, attempt + 1);
+            usleep(attempt < 3 ? 200000 : 1000000);
+        }
+        if (!done) {
+            fprintf(stderr, "metal_eval_batch: giving up after repeated command buffer failures\n");
+            exit(1);
+        }
+    }
 
     std::vector<CandidateResultMSL> h_res_f(n);
     memcpy(h_res_f.data(), [m->buf_res contents], n * sizeof(CandidateResultMSL));
@@ -606,8 +654,9 @@ static std::vector<double> metal_eval_batch(
     std::vector<CandidateResult> results(n);
     for (int i = 0; i < n; i++) {
         CandidateResult& r = results[i];
-        r.S_AA = h_res_f[i].S_AA; r.S_A1 = h_res_f[i].S_A1; r.S_11 = h_res_f[i].S_11;
-        r.S_Ay = h_res_f[i].S_Ay; r.S_1y = h_res_f[i].S_1y; r.S_yy = h_res_f[i].S_yy;
+        const CandidateResultMSL& h = h_res_f[i];
+        r.S_AA = (double)h.S_AA + (double)h.L_AA; r.S_A1 = (double)h.S_A1 + (double)h.L_A1; r.S_11 = (double)h.S_11 + (double)h.L_11;
+        r.S_Ay = (double)h.S_Ay + (double)h.L_Ay; r.S_1y = (double)h.S_1y + (double)h.L_1y; r.S_yy = (double)h.S_yy + (double)h.L_yy;
         r.n_bad = h_res_f[i].n_bad; r.overflow = h_res_f[i].overflow; r.poisoned = h_res_f[i].poisoned;
         for (int k = 0; k < h_res_f[i].n_bad && k < KAMPYLOS_MAX_BAD_POINTS; k++) r.bad_idx[k] = h_res_f[i].bad_idx[k];
     }

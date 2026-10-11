@@ -127,13 +127,20 @@ void opencl_fit_upload_light_curve(OpenCLFitContext& ctx, const std::vector<Data
         ctx.h_data.size() * sizeof(LightCurvePoint), ctx.h_data.data(), &err);
 }
 
+// A failed OpenCL call used to be ignored: the fit then went on with stale or missing results (review 2026-10-10, B2).
+// Fail loudly instead: the BOINC wrapper reports the error and the task is retried elsewhere.
+#define KAMPYLOS_CL_CHECK(expr) do { cl_int e__ = (expr); if (e__ != CL_SUCCESS) { \
+    fprintf(stderr, "OpenCL error %d in %s (%s:%d)\n", (int)e__, #expr, __FILE__, __LINE__); exit(1); } } while (0)
+
 static void ensure_cand_capacity(OpenCLFitContext& ctx, int n) {
     if (n <= ctx.cand_capacity) return;
     if (ctx.d_cand) cl_api.ReleaseMemObject(ctx.d_cand);
     if (ctx.d_res) cl_api.ReleaseMemObject(ctx.d_res);
     cl_int err;
     ctx.d_cand = cl_api.CreateBuffer(ctx.context, CL_MEM_READ_ONLY, n * sizeof(Candidate), NULL, &err);
+    KAMPYLOS_CL_CHECK(err);
     ctx.d_res = cl_api.CreateBuffer(ctx.context, CL_MEM_WRITE_ONLY, n * sizeof(CandidateResult), NULL, &err);
+    KAMPYLOS_CL_CHECK(err);
     ctx.cand_capacity = n;
 }
 
@@ -146,7 +153,7 @@ static std::vector<double> opencl_eval_batch(
     if (n == 0) return chi2;
 
     ensure_cand_capacity(ctx, n);
-    cl_api.EnqueueWriteBuffer(ctx.queue, ctx.d_cand, CL_TRUE, 0, n * sizeof(Candidate), points.data(), 0, NULL, NULL);
+    KAMPYLOS_CL_CHECK(cl_api.EnqueueWriteBuffer(ctx.queue, ctx.d_cand, CL_TRUE, 0, n * sizeof(Candidate), points.data(), 0, NULL, NULL));
 
     int local_size = 128;
     size_t sh_bytes = 7 * local_size * sizeof(double);
@@ -163,11 +170,11 @@ static std::vector<double> opencl_eval_batch(
 
     size_t global_size = (size_t)n * local_size;
     size_t local_size_t = (size_t)local_size;
-    cl_api.EnqueueNDRangeKernel(ctx.queue, ctx.kernel, 1, NULL, &global_size, &local_size_t, 0, NULL, NULL);
-    cl_api.Finish(ctx.queue);
+    KAMPYLOS_CL_CHECK(cl_api.EnqueueNDRangeKernel(ctx.queue, ctx.kernel, 1, NULL, &global_size, &local_size_t, 0, NULL, NULL));
+    KAMPYLOS_CL_CHECK(cl_api.Finish(ctx.queue));
 
     std::vector<CandidateResult> h_res(n);
-    cl_api.EnqueueReadBuffer(ctx.queue, ctx.d_res, CL_TRUE, 0, n * sizeof(CandidateResult), h_res.data(), 0, NULL, NULL);
+    KAMPYLOS_CL_CHECK(cl_api.EnqueueReadBuffer(ctx.queue, ctx.d_res, CL_TRUE, 0, n * sizeof(CandidateResult), h_res.data(), 0, NULL, NULL));
 
     // Same fix as gpu_fit_binary.cu's own gpu_eval_batch() (see that file and
     // kampylos_cpu_patch_pool.h for the full story) -- this loop was the same single-threaded

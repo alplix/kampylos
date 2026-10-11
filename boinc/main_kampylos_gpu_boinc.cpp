@@ -25,7 +25,12 @@
 
 #include "kampylos_boinc_common.h"
 
-#define KAMPYLOS_GPU_VERSION "2"
+// The version printed in stderr: build with -DKAMPYLOS_APP_VERSION='"<server version_num>"' so forum bug reports and the
+// server's app_version agree (the built-in value only exists for ad-hoc builds).
+#ifndef KAMPYLOS_APP_VERSION
+#define KAMPYLOS_APP_VERSION "dev-2"
+#endif
+#define KAMPYLOS_GPU_VERSION KAMPYLOS_APP_VERSION
 
 // BOINC hands GPU app_versions the device index via "--device N" on the command line -- same
 // convention as main_jump_gpu_boinc.cpp/main_range_gpu_boinc.cpp.

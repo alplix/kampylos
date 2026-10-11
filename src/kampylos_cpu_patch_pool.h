@@ -69,8 +69,16 @@
 
 class KampylosCpuPatchPool {
 public:
+#ifdef VBM_THREAD_SAFE
     explicit KampylosCpuPatchPool(int n_threads = 4)
         : vbms_(std::max(1, n_threads)) {
+#else
+    // Upstream VBMicrolensing keeps 200+ function-local statics shared by every thread: calling BinaryMag2 from several
+    // threads corrupts the heap. Without the thread_local patch (macro VBM_THREAD_SAFE, see vendor/VBMicrolensing) the
+    // pool runs the completion step on the calling thread only.
+    explicit KampylosCpuPatchPool(int /*n_threads*/ = 4)
+        : vbms_(1) {
+#endif
         for (int t = 1; t < (int)vbms_.size(); t++) workers_.emplace_back([this, t]() { worker_loop(t); });
     }
     KampylosCpuPatchPool(const KampylosCpuPatchPool&) = delete;

@@ -30,7 +30,12 @@
 
 #include "kampylos_boinc_common.h"
 
-#define KAMPYLOS_VERSION "4"
+// The version printed in stderr: build with -DKAMPYLOS_APP_VERSION='"<server version_num>"' so forum bug reports and the
+// server's app_version agree (the built-in value only exists for ad-hoc builds).
+#ifndef KAMPYLOS_APP_VERSION
+#define KAMPYLOS_APP_VERSION "dev-4"
+#endif
+#define KAMPYLOS_VERSION KAMPYLOS_APP_VERSION
 
 // v3 (2026-10-09, forum threads 72 and 87): a CPU task is often ONE grid cell, and one cell can run
 // for many hours (dozens of seeds x a restart-backed simplex over thousands of data points), while
@@ -55,16 +60,17 @@ static bool read_seed_checkpoint(int *cell, size_t *next, BinaryFitResult *best)
     return ok;
 }
 
-static void write_seed_checkpoint(int cell, size_t next, const BinaryFitResult &b) {
+// returns false when the checkpoint could not be written (the caller then must not tell the client it did)
+static bool write_seed_checkpoint(int cell, size_t next, const BinaryFitResult &b) {
     char path[512];
-    if (boinc_resolve_filename(SEED_CHECKPOINT_NAME, path, sizeof(path))) return;
+    if (boinc_resolve_filename(SEED_CHECKPOINT_NAME, path, sizeof(path))) return false;
     std::string tmp = std::string(path) + ".tmp";
     FILE *f = boinc_fopen(tmp.c_str(), "w");
-    if (!f) return;
+    if (!f) return false;
     fprintf(f, "%d %lu %.17g %.17g %.17g %.17g %.17g %.17g %.17g %.17g %.17g %.17g\n", cell, (unsigned long)next,
             b.log_s, b.log_q, b.t0, b.u0, b.tE, b.alpha, b.rho, b.fs, b.fb, b.chi2);
     fclose(f);
-    boinc_rename(tmp.c_str(), path);
+    return boinc_rename(tmp.c_str(), path) == 0;
 }
 
 int main(int argc, char **argv) {
@@ -120,8 +126,7 @@ int main(int argc, char **argv) {
             own_done++;
             boinc_fraction_done((cell + (double)own_done / (double)(own_total ? own_total : 1)) / (double)job.total);
             if (boinc_time_to_checkpoint()) {
-                write_seed_checkpoint(cell, k + 1, best);
-                boinc_checkpoint_completed();
+                if (write_seed_checkpoint(cell, k + 1, best)) boinc_checkpoint_completed();
             }
         }
         cell++;

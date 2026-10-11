@@ -46,6 +46,7 @@ struct GpuFitContext {
     static void check(cudaError_t e, const char* what) {
         if (e != cudaSuccess) {
             fprintf(stderr, "GpuFitContext: %s failed: %s\n", what, cudaGetErrorString(e));
+            exit(1);   // never carry on with null device pointers / stale results (review 2026-10-10, B2)
         }
     }
 

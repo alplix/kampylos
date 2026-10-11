@@ -20,7 +20,12 @@
 
 #include "kampylos_boinc_common.h"
 
-#define KAMPYLOS_METAL_VERSION "2"
+// The version printed in stderr: build with -DKAMPYLOS_APP_VERSION='"<server version_num>"' so forum bug reports and the
+// server's app_version agree (the built-in value only exists for ad-hoc builds).
+#ifndef KAMPYLOS_APP_VERSION
+#define KAMPYLOS_APP_VERSION "dev-2"
+#endif
+#define KAMPYLOS_METAL_VERSION KAMPYLOS_APP_VERSION
 
 int main(int argc, char **argv) {
     (void)argc; (void)argv;

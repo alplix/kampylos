@@ -45,6 +45,9 @@ inline std::vector<DataPoint> load_photometry(const std::string& path, bool inpu
         }
         if (dp.sigma > 0 && std::isfinite(dp.flux)) out.push_back(dp);
     }
+    // raw_peak_anchor() and the span computations assume time order; a concatenated or unsorted file used to give a
+    // wrong or negative span (review 2026-10-10, B3). Stable, so already sorted files are untouched.
+    std::stable_sort(out.begin(), out.end(), [](const DataPoint& x, const DataPoint& y) { return x.t < y.t; });
     return out;
 }
 

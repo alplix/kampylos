@@ -31,13 +31,47 @@ static int kampylos_read_checkpoint() {
     return done;
 }
 
+// Written through a temporary file and renamed, so a crash can never leave a torn checkpoint behind.
 static void kampylos_write_checkpoint(int done) {
     char path[512];
     if (boinc_resolve_filename(KAMPYLOS_CHECKPOINT_NAME, path, sizeof(path))) return;
-    FILE *f = boinc_fopen(path, "w");
+    std::string tmp = std::string(path) + ".tmp";
+    FILE *f = boinc_fopen(tmp.c_str(), "w");
     if (!f) return;
     fprintf(f, "%d\n", done);
     fclose(f);
+    boinc_rename(tmp.c_str(), path);
+}
+
+// The CPU app's seed-level checkpoint (see main_kampylos_boinc.cpp) belongs to the cell being fitted; it is removed
+// as soon as that cell is finished, so a stale one can never be mistaken for a later cell's.
+static const char *KAMPYLOS_SEED_CHECKPOINT_NAME = "kampylos_seed_checkpoint";
+static void kampylos_remove_seed_checkpoint() {
+    char path[512];
+    if (boinc_resolve_filename(KAMPYLOS_SEED_CHECKPOINT_NAME, path, sizeof(path))) return;
+    boinc_delete_file(path);
+}
+
+// Number of complete result lines (finished cells) in an existing "out", or -1 if it has no valid format-2 header.
+// The lines are the authoritative record of finished cells: each one is written and flushed only after its cell is done.
+static int kampylos_count_done_cells(const char *path) {
+    FILE *f = boinc_fopen(path, "rb");
+    if (!f) return -1;
+    std::string content;
+    char buf[8192];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), f)) > 0) content.append(buf, n);
+    fclose(f);
+    if (content.compare(0, 7, "# grid=") != 0) return -1;
+    int lines = 0;
+    size_t pos = 0;
+    while (pos < content.size()) {
+        size_t eol = content.find('\n', pos);
+        if (eol == std::string::npos) break;           // torn last line
+        if (content[pos] != '#') lines++;
+        pos = eol + 1;
+    }
+    return lines;
 }
 
 struct KampylosBoincJob {
@@ -108,12 +142,17 @@ static int kampylos_boinc_open_output(KampylosBoincJob &job, const char *backend
         fprintf(stderr, "can't resolve output file 'out'\n");
         return 1;
     }
-    job.start_cell = kampylos_read_checkpoint();
-    if (job.start_cell < 0 || job.start_cell > job.total) job.start_cell = 0;
+    // Resume point = the number of complete cell lines already in "out" (they are the record of finished cells; the
+    // cell checkpoint file can only be older or missing, never ahead). Nothing finished is ever thrown away.
+    int in_file = kampylos_count_done_cells(out_path);
+    int cp = kampylos_read_checkpoint();
+    job.start_cell = in_file > 0 ? in_file : 0;
+    if (job.start_cell > job.total) job.start_cell = job.total;
     if (job.start_cell > 0 && !kampylos_trim_output(out_path, job.start_cell)) {
-        fprintf(stderr, "checkpoint says %d cells done but the output file doesn't match -- restarting from cell 0\n", job.start_cell);
+        fprintf(stderr, "output file unreadable after %d cells -- restarting from cell 0\n", job.start_cell);
         job.start_cell = 0;
     }
+    if (cp != job.start_cell) fprintf(stderr, "cell checkpoint %d, finished lines in out %d: resuming from %d\n", cp, in_file, job.start_cell);
     fprintf(stderr, "Resuming from cell %d/%d\n", job.start_cell, job.total);
     job.fout = boinc_fopen(out_path, job.start_cell == 0 ? "w" : "a");
     if (!job.fout) {
@@ -129,10 +168,13 @@ static int kampylos_boinc_open_output(KampylosBoincJob &job, const char *backend
 
 static void kampylos_boinc_after_cell(int done, int total) {
     boinc_fraction_done((double)done / (double)total);
-    if (boinc_time_to_checkpoint()) {
-        kampylos_write_checkpoint(done);
-        boinc_checkpoint_completed();
-    }
+    // Once per cell (minutes to hours apart): always, and not only when the client's timer says so -- the CPU app's
+    // seed checkpoints used to consume that timer and starve this one (review 2026-10-10).
+    boinc_begin_critical_section();
+    kampylos_write_checkpoint(done);
+    kampylos_remove_seed_checkpoint();
+    boinc_end_critical_section();
+    boinc_checkpoint_completed();
 }
 
 // Runs every remaining cell with `fit_cell` and finishes the WU.
