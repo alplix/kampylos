@@ -63,6 +63,16 @@ int main(int argc, char **argv) {
 
     VBMicrolensing vbm;
     return kampylos_boinc_run(job, vbm, [&](double ln_s, double ln_q, const BinarySeedSet &seeds) {
-        return metal_fit_binary_seeds(metal_ctx, job.data, ln_s, ln_q, seeds);
+        try {
+            return metal_fit_binary_seeds(metal_ctx, job.data, ln_s, ln_q, seeds);
+        } catch (const std::exception &e) {
+            // A command buffer kept failing even after re-submission (another process may be
+            // monopolising the GPU, or the device was lost): stop with the reason in stderr
+            // rather than write a cell computed from stale results. The client restarts the
+            // task from its last checkpoint.
+            fprintf(stderr, "metal_fit_binary_seeds failed: %s\n", e.what());
+            boinc_finish(1);
+            return BinaryFitResult{};
+        }
     });
 }

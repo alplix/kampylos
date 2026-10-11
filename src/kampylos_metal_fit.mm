@@ -25,11 +25,23 @@
 // -- float<->double conversion happens at upload (metal_fit_upload_light_curve) and at the
 // completion step (metal_eval_batch, reusing kampylos_gpu_complete.h's existing double-based
 // CandidateResult by converting the float kernel output into it).
+//
+// COMPILE OPTIONS, also before touching this file: the kernel must be compiled with fast math
+// OFF (metal_fit_select_device sets it and the kampylos_ds_selftest kernel verifies it).
+// Metal's default fast math is free to re-associate the error-free transformations the ds
+// layer rests on, which silently turns it back into float32 -- the 460x failure above.
+//
+// ERRORS: every command buffer's status is checked and a failed one is re-submitted (see
+// metal_eval_batch); a persistent failure throws std::runtime_error, which the callers turn
+// into a clean exit. Never read buf_res after an unchecked buffer: it holds the previous round.
 #import <Metal/Metal.h>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <cmath>
+#include <stdexcept>
+#include <string>
+#include <unistd.h>
 
 #include "kampylos_gpu_types.h"
 #include "kampylos_gpu_complete.h"
@@ -310,31 +322,27 @@ inline bool binary_mag2_fastpath_ok(thread const BinaryMag0Result& r, float rho,
     return (cq < Tol) && (cq2 < 1.0) && (r.safedist > 4.0 * rho2);
 }
 
-// ---- Kernel entry point: per-candidate running sums use Kahan-compensated float summation,
-// NOT plain float accumulation -- a light curve can have thousands of points per thread's own
-// slice of the loop, and naive float accumulation over that many terms loses real precision in a
-// way the per-point ds-arithmetic above doesn't fix (that only guards the PER-POINT magnitude
-// calculation, not a long running sum of many such values). Kahan summation is the standard,
-// well-understood fix for exactly this (not re-derived here, not the kind of thing that needed
-// its own from-scratch numerical validation the way the quintic solver did).
+// ---- Kernel entry point: the six per-candidate running sums are formed AND accumulated in
+// double-single (2026-10-10). They used to be float products (w*A*A ~ 1e6 with a 6e-8 relative
+// rounding error each) under Kahan summation; Kahan protects the sum, not the products, and the
+// products' rounding alone left 0.1-0.4 chi2 of candidate-to-candidate noise in the objective
+// (measured on the synthetic planet cell against the CPU chi2) -- enough to steer Nelder-Mead
+// (ftol 1e-9) into a wrong basin: that cell ended at chi2 689 instead of the CPU's 411. With ds
+// products and sums the disagreement is ~0.002 and the cell reproduces the CPU result exactly.
+// Each sum is returned as a hi/lo float pair and promoted to double on the host.
 struct LightCurvePointMSL { float t, flux, sigma; };
 struct CandidateMSL { float t0, u0, log_tE, alpha, log_rho; };
 
 #define KAMPYLOS_MSL_MAX_BAD_POINTS 512
 struct CandidateResultMSL {
     float S_AA, S_A1, S_11, S_Ay, S_1y, S_yy;
+    float S_AA_lo, S_A1_lo, S_11_lo, S_Ay_lo, S_1y_lo, S_yy_lo;
     int n_bad;
     int overflow;
     int bad_idx[KAMPYLOS_MSL_MAX_BAD_POINTS];
     int poisoned;
 };
-
-inline void kahan_add(thread float& sum, thread float& c, float value) {
-    float y = value - c;
-    float t = sum + y;
-    c = (t - sum) - y;
-    sum = t;
-}
+#define KAMPYLOS_MSL_NREDUCE 13   // 6 sums x (hi, lo) + the "any point invalid" flag
 
 kernel void kampylos_eval_candidates(
     device const LightCurvePointMSL* data [[buffer(0)]],
@@ -375,8 +383,7 @@ kernel void kampylos_eval_candidates(
     float salpha = sin(c.alpha), calpha = cos(c.alpha);
     float tE_inv = 1.0 / tE;
 
-    float S_AA = 0, S_A1 = 0, S_11 = 0, S_Ay = 0, S_1y = 0, S_yy = 0;
-    float c_AA = 0, c_A1 = 0, c_11 = 0, c_Ay = 0, c_1y = 0, c_yy = 0; // Kahan compensators
+    ds S_AA = dsmake(0), S_A1 = dsmake(0), S_11 = dsmake(0), S_Ay = dsmake(0), S_1y = dsmake(0), S_yy = dsmake(0);
     float any_invalid = 0;
 
     for (int i = (int)lid; i < n_points; i += (int)lsize) {
@@ -401,51 +408,71 @@ kernel void kampylos_eval_candidates(
             continue;
         }
 
-        float sigma = data[i].sigma;
-        float w = 1.0 / (sigma * sigma);
-        float flux = data[i].flux;
-        kahan_add(S_AA, c_AA, w * A * A);
-        kahan_add(S_A1, c_A1, w * A);
-        kahan_add(S_11, c_11, w);
-        kahan_add(S_Ay, c_Ay, w * A * flux);
-        kahan_add(S_1y, c_1y, w * flux);
-        kahan_add(S_yy, c_yy, w * flux * flux);
+        ds dsig = dsmake(data[i].sigma);
+        ds dw = ds_div(dsmake(1.0), ds_mul(dsig, dsig));
+        ds dA = dsmake(A);
+        ds df = dsmake(data[i].flux);
+        S_AA = ds_add(S_AA, ds_mul(dw, ds_mul(dA, dA)));
+        S_A1 = ds_add(S_A1, ds_mul(dw, dA));
+        S_11 = ds_add(S_11, dw);
+        S_Ay = ds_add(S_Ay, ds_mul(dw, ds_mul(dA, df)));
+        S_1y = ds_add(S_1y, ds_mul(dw, df));
+        S_yy = ds_add(S_yy, ds_mul(dw, ds_mul(df, df)));
     }
 
+    // Lanes 0-5 hold the hi parts, 6-11 the lo parts, 12 the invalid flag.
     int tid = (int)lid, ls = (int)lsize;
-    sh[0 * ls + tid] = S_AA;
-    sh[1 * ls + tid] = S_A1;
-    sh[2 * ls + tid] = S_11;
-    sh[3 * ls + tid] = S_Ay;
-    sh[4 * ls + tid] = S_1y;
-    sh[5 * ls + tid] = S_yy;
-    sh[6 * ls + tid] = any_invalid;
+    sh[0 * ls + tid] = S_AA.hi; sh[6 * ls + tid] = S_AA.lo;
+    sh[1 * ls + tid] = S_A1.hi; sh[7 * ls + tid] = S_A1.lo;
+    sh[2 * ls + tid] = S_11.hi; sh[8 * ls + tid] = S_11.lo;
+    sh[3 * ls + tid] = S_Ay.hi; sh[9 * ls + tid] = S_Ay.lo;
+    sh[4 * ls + tid] = S_1y.hi; sh[10 * ls + tid] = S_1y.lo;
+    sh[5 * ls + tid] = S_yy.hi; sh[11 * ls + tid] = S_yy.lo;
+    sh[12 * ls + tid] = any_invalid;
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Combining the (already Kahan-compensated) per-thread partial sums across threads: plain
-    // tree-reduction addition is fine here -- only ~lsize (e.g. 128) terms at this stage, not
-    // thousands, so the "many terms" precision problem the per-thread loop above guards against
-    // doesn't re-appear at this scale.
     for (uint stride = lsize / 2; stride > 0; stride >>= 1) {
         if (lid < stride) {
-            for (int k = 0; k < 7; k++) sh[k * ls + tid] += sh[k * ls + tid + (int)stride];
+            for (int k = 0; k < 6; k++) {
+                ds a = dsmake(sh[k * ls + tid], sh[(k + 6) * ls + tid]);
+                ds b = dsmake(sh[k * ls + tid + (int)stride], sh[(k + 6) * ls + tid + (int)stride]);
+                ds r = ds_add(a, b);
+                sh[k * ls + tid] = r.hi; sh[(k + 6) * ls + tid] = r.lo;
+            }
+            sh[12 * ls + tid] += sh[12 * ls + tid + (int)stride];
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
     if (lid == 0) {
         device CandidateResultMSL& r = results[cand_idx];
-        if (sh[6 * ls] > 0) {
+        if (sh[12 * ls] > 0) {
             r.S_AA = r.S_A1 = r.S_11 = r.S_Ay = r.S_1y = r.S_yy = 0;
+            r.S_AA_lo = r.S_A1_lo = r.S_11_lo = r.S_Ay_lo = r.S_1y_lo = r.S_yy_lo = 0;
             r.n_bad = 0; r.overflow = 0; r.poisoned = 1;
         } else {
             r.S_AA = sh[0 * ls]; r.S_A1 = sh[1 * ls]; r.S_11 = sh[2 * ls];
             r.S_Ay = sh[3 * ls]; r.S_1y = sh[4 * ls]; r.S_yy = sh[5 * ls];
+            r.S_AA_lo = sh[6 * ls]; r.S_A1_lo = sh[7 * ls]; r.S_11_lo = sh[8 * ls];
+            r.S_Ay_lo = sh[9 * ls]; r.S_1y_lo = sh[10 * ls]; r.S_yy_lo = sh[11 * ls];
             r.n_bad = min(atomic_load_explicit(bad_count, memory_order_relaxed), (int)KAMPYLOS_MSL_MAX_BAD_POINTS);
             r.overflow = atomic_load_explicit(overflow_flag, memory_order_relaxed);
             r.poisoned = 0;
         }
     }
+}
+
+// Guard against the compiler re-associating the error-free transformations everything above
+// rests on (Metal's DEFAULT is fast math, which is allowed to do exactly that and silently turns
+// the whole double-single layer back into plain float32 -- see the host's compile options).
+// Both lo parts are exact powers of two; with fast math they come out as 0.
+kernel void kampylos_ds_selftest(device float* out [[buffer(0)]], uint tid [[thread_position_in_grid]]) {
+    if (tid != 0) return;
+    float a = 1.0f + 1.0f / 4096.0f;                  // (1 + 2^-12)^2 = 1 + 2^-11 + 2^-24
+    float p_hi, p_lo; two_prod(a, a, p_hi, p_lo);
+    out[0] = p_lo;                                    // exact: 2^-24
+    float s_hi, s_lo; two_sum(1.0f, 1.0f / 1073741824.0f, s_hi, s_lo);
+    out[1] = s_lo;                                    // exact: 2^-30
 }
 )MSL";
 
@@ -459,11 +486,22 @@ struct CandidateMSL { float t0, u0, log_tE, alpha, log_rho; };
 #define KAMPYLOS_MSL_MAX_BAD_POINTS_HOST 512
 struct CandidateResultMSL {
     float S_AA, S_A1, S_11, S_Ay, S_1y, S_yy;
+    float S_AA_lo, S_A1_lo, S_11_lo, S_Ay_lo, S_1y_lo, S_yy_lo;
     int n_bad;
     int overflow;
     int bad_idx[KAMPYLOS_MSL_MAX_BAD_POINTS_HOST];
     int poisoned;
 };
+#define KAMPYLOS_MSL_NREDUCE_HOST 13
+
+// Work per command buffer, in candidate x data-point evaluations. Measured on a base M1: 1440
+// candidates x 4010 points (5.8e6) = 0.69 s, so this is ~0.5 s per buffer. Short buffers are not
+// a watchdog workaround (a 3.4 s buffer completes fine on an idle GPU) but what makes the retry
+// below cheap: when another process is hammering the same GPU the driver sporadically aborts
+// in-flight command buffers of EVERY process with "Internal Error (0000000e)", and a buffer
+// that is re-submitted after that normally completes.
+#define KAMPYLOS_METAL_BUFFER_BUDGET 4.0e6
+#define KAMPYLOS_METAL_MAX_ATTEMPTS 6
 
 // ---------------------------------------------------------------------------------------------
 // Host-side orchestration -- same shape as gpu_fit_binary.cu/kampylos_opencl_fit.cpp, differing
@@ -492,6 +530,8 @@ struct MetalFitImpl {
     id<MTLBuffer> buf_cand = nil;
     id<MTLBuffer> buf_res = nil;
     int cand_capacity = 0;
+    int local_size = 128;          // threads per threadgroup (power of two, <= the pipeline's maximum)
+    long buffers_retried = 0;      // command buffers that failed at least once and were re-run
 };
 
 MetalFitContext::MetalFitContext() { impl = new MetalFitImpl(); }
@@ -511,7 +551,22 @@ bool metal_fit_select_device(MetalFitContext& ctx, std::string* err_out) {
 
     NSError* error = nil;
     NSString* src = [NSString stringWithUTF8String:kKampylosMSLSource];
-    id<MTLLibrary> library = [m->device newLibraryWithSource:src options:nil error:&error];
+    // 2026-10-10: Metal compiles with fast math unless told otherwise, and fast math may
+    // re-associate `lo = (a - (hi - bb)) + (b - bb)` and `lo = fma(a, b, -hi)` to 0 -- the whole
+    // double-single layer silently degrades to float32, the quintic solver then fails on
+    // ordinary planetary-regime points and the kernel poisons those candidates (measured: the
+    // TRUE parameters of the synthetic planet evaluated to chi2 = 1e18 on an M1, and the cell
+    // converged to 692 instead of 411). fastMathEnabled is the macOS 10.x-14 spelling, mathMode
+    // the macOS 15 one; set both, and verify with the self-test kernel below.
+    MTLCompileOptions* copts = [[MTLCompileOptions alloc] init];
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    copts.fastMathEnabled = NO;
+#pragma clang diagnostic pop
+#if defined(__MAC_15_0) && __MAC_OS_X_VERSION_MAX_ALLOWED >= 150000
+    if (@available(macOS 15.0, *)) copts.mathMode = MTLMathModeSafe;
+#endif
+    id<MTLLibrary> library = [m->device newLibraryWithSource:src options:copts error:&error];
     if (!library) {
         if (err_out) *err_out = std::string("MSL compile failed: ") + (error ? [[error localizedDescription] UTF8String] : "unknown");
         return false;
@@ -521,6 +576,33 @@ bool metal_fit_select_device(MetalFitContext& ctx, std::string* err_out) {
     m->pipeline = [m->device newComputePipelineStateWithFunction:fn error:&error];
     if (!m->pipeline) {
         if (err_out) *err_out = std::string("newComputePipelineStateWithFunction failed: ") + (error ? [[error localizedDescription] UTF8String] : "unknown");
+        return false;
+    }
+    // The reduction needs a power of two; 128 fits every Apple GPU but ask rather than assume.
+    int max_threads = (int)m->pipeline.maxTotalThreadsPerThreadgroup;
+    m->local_size = 128;
+    while (m->local_size > max_threads && m->local_size > 1) m->local_size /= 2;
+
+    // Self-test: both lo parts are exact powers of two unless the compiler broke the error-free
+    // transformations (see above). Refuse to run rather than return garbage.
+    id<MTLFunction> self_fn = [library newFunctionWithName:@"kampylos_ds_selftest"];
+    id<MTLComputePipelineState> self_pipe = self_fn ? [m->device newComputePipelineStateWithFunction:self_fn error:&error] : nil;
+    if (!self_pipe) { if (err_out) *err_out = "double-single self-test kernel not found"; return false; }
+    id<MTLBuffer> self_buf = [m->device newBufferWithLength:16 options:MTLResourceStorageModeShared];
+    memset([self_buf contents], 0, 16);
+    id<MTLCommandBuffer> cb = [m->queue commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+    [enc setComputePipelineState:self_pipe];
+    [enc setBuffer:self_buf offset:0 atIndex:0];
+    [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+    [enc endEncoding];
+    [cb commit];
+    [cb waitUntilCompleted];
+    const float* lo = (const float*)[self_buf contents];
+    if (cb.status != MTLCommandBufferStatusCompleted || lo[0] != 1.0f / 16777216.0f || lo[1] != 1.0f / 1073741824.0f) {
+        char buf[200];
+        snprintf(buf, sizeof(buf), "double-single self-test failed (two_prod lo = %g, two_sum lo = %g): the Metal compiler applied fast math, results would be wrong", lo[0], lo[1]);
+        if (err_out) *err_out = buf;
         return false;
     }
     return true;
@@ -576,48 +658,80 @@ static std::vector<double> metal_eval_batch(
 
     float s_f = (float)s, q_f = (float)q;
 
-    id<MTLCommandBuffer> cmdbuf = [m->queue commandBuffer];
-    id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
-    [enc setComputePipelineState:m->pipeline];
-    [enc setBuffer:m->buf_data offset:0 atIndex:0];
-    [enc setBytes:&m->n_points length:sizeof(int) atIndex:1];
-    [enc setBytes:&s_f length:sizeof(float) atIndex:2];
-    [enc setBytes:&q_f length:sizeof(float) atIndex:3];
-    [enc setBuffer:m->buf_cand offset:0 atIndex:4];
-    [enc setBytes:&n length:sizeof(int) atIndex:5];
-    [enc setBuffer:m->buf_res offset:0 atIndex:6];
-    int local_size = 128;
-    [enc setThreadgroupMemoryLength:7 * local_size * sizeof(float) atIndex:0];
-    [enc setThreadgroupMemoryLength:sizeof(int) atIndex:1];
-    [enc setThreadgroupMemoryLength:sizeof(int) atIndex:2];
-    [enc dispatchThreadgroups:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(local_size, 1, 1)];
-    [enc endEncoding];
-    [cmdbuf commit];
-    [cmdbuf waitUntilCompleted];
+    // One command buffer per chunk of candidates (see KAMPYLOS_METAL_BUFFER_BUDGET), each checked
+    // and re-submitted on failure. Before 2026-10-10 the whole batch went into one buffer whose
+    // status was never read: an aborted buffer left the previous round's numbers in buf_res and
+    // the fit went on with them.
+    int chunk = (int)(KAMPYLOS_METAL_BUFFER_BUDGET / std::max(1, m->n_points));
+    chunk = std::max(16, std::min(chunk, 4096));
+    for (int c0 = 0; c0 < n; c0 += chunk) {
+        int nc = std::min(chunk, n - c0);
+        std::string last_error;
+        bool done = false;
+        for (int attempt = 1; attempt <= KAMPYLOS_METAL_MAX_ATTEMPTS && !done; attempt++) {
+            id<MTLCommandBuffer> cmdbuf = [m->queue commandBuffer];
+            id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
+            [enc setComputePipelineState:m->pipeline];
+            [enc setBuffer:m->buf_data offset:0 atIndex:0];
+            [enc setBytes:&m->n_points length:sizeof(int) atIndex:1];
+            [enc setBytes:&s_f length:sizeof(float) atIndex:2];
+            [enc setBytes:&q_f length:sizeof(float) atIndex:3];
+            [enc setBuffer:m->buf_cand offset:c0 * sizeof(CandidateMSL) atIndex:4];
+            [enc setBytes:&nc length:sizeof(int) atIndex:5];
+            [enc setBuffer:m->buf_res offset:c0 * sizeof(CandidateResultMSL) atIndex:6];
+            // threadgroup memory lengths must be multiples of 16 bytes
+            [enc setThreadgroupMemoryLength:KAMPYLOS_MSL_NREDUCE_HOST * m->local_size * sizeof(float) atIndex:0];
+            [enc setThreadgroupMemoryLength:16 atIndex:1];
+            [enc setThreadgroupMemoryLength:16 atIndex:2];
+            [enc dispatchThreadgroups:MTLSizeMake(nc, 1, 1) threadsPerThreadgroup:MTLSizeMake(m->local_size, 1, 1)];
+            [enc endEncoding];
+            [cmdbuf commit];
+            [cmdbuf waitUntilCompleted];
+            if (cmdbuf.status == MTLCommandBufferStatusCompleted && cmdbuf.error == nil) { done = true; break; }
+            last_error = cmdbuf.error ? [[cmdbuf.error localizedDescription] UTF8String] : "no error object";
+            fprintf(stderr, "metal_eval_batch: command buffer (%d candidates) failed, status %ld: %s -- attempt %d of %d\n",
+                    nc, (long)cmdbuf.status, last_error.c_str(), attempt, KAMPYLOS_METAL_MAX_ATTEMPTS);
+            if (attempt == 1) m->buffers_retried++;
+            usleep(200000 * attempt);
+        }
+        if (!done) throw std::runtime_error("Metal command buffer failed " + std::to_string(KAMPYLOS_METAL_MAX_ATTEMPTS) +
+                                            " times in a row: " + last_error);
+    }
 
     std::vector<CandidateResultMSL> h_res_f(n);
     memcpy(h_res_f.data(), [m->buf_res contents], n * sizeof(CandidateResultMSL));
 
     // Promote the kernel's float output into the shared (double-based) CandidateResult type so
     // kampylos_complete_candidate() -- unchanged, same as every other backend -- can patch in the
-    // bad points via the real VBMicrolensing library and derive the final chi2 in double. This
-    // conversion pass is cheap (plain struct field copies, no VBMicrolensing calls) and stays
-    // sequential; only the actual patch-completion step below is worth parallelizing.
+    // bad points via the real VBMicrolensing library and derive the final chi2 in double. Each
+    // sum is a double-single pair; hi + lo in double is exact. This conversion pass is cheap
+    // (plain struct field copies, no VBMicrolensing calls) and stays sequential; only the actual
+    // patch-completion step below is worth parallelizing.
     std::vector<CandidateResult> results(n);
     for (int i = 0; i < n; i++) {
         CandidateResult& r = results[i];
-        r.S_AA = h_res_f[i].S_AA; r.S_A1 = h_res_f[i].S_A1; r.S_11 = h_res_f[i].S_11;
-        r.S_Ay = h_res_f[i].S_Ay; r.S_1y = h_res_f[i].S_1y; r.S_yy = h_res_f[i].S_yy;
-        r.n_bad = h_res_f[i].n_bad; r.overflow = h_res_f[i].overflow; r.poisoned = h_res_f[i].poisoned;
-        for (int k = 0; k < h_res_f[i].n_bad && k < KAMPYLOS_MAX_BAD_POINTS; k++) r.bad_idx[k] = h_res_f[i].bad_idx[k];
+        const CandidateResultMSL& f = h_res_f[i];
+        r.S_AA = (double)f.S_AA + (double)f.S_AA_lo; r.S_A1 = (double)f.S_A1 + (double)f.S_A1_lo;
+        r.S_11 = (double)f.S_11 + (double)f.S_11_lo; r.S_Ay = (double)f.S_Ay + (double)f.S_Ay_lo;
+        r.S_1y = (double)f.S_1y + (double)f.S_1y_lo; r.S_yy = (double)f.S_yy + (double)f.S_yy_lo;
+        r.n_bad = f.n_bad; r.overflow = f.overflow; r.poisoned = f.poisoned;
+        for (int k = 0; k < f.n_bad && k < KAMPYLOS_MAX_BAD_POINTS; k++) r.bad_idx[k] = f.bad_idx[k];
     }
     // Same fix as gpu_fit_binary.cu's own gpu_eval_batch() (see that file and
     // kampylos_cpu_patch_pool.h for the full story) -- this was the same single-threaded
     // bottleneck for a pathological anchor, now spread across a small worker-thread pool instead.
     // Created once, never destroyed: see kampylos_cpu_patch_pool.h (persistent workers).
-    static KampylosCpuPatchPool& patch_pool = *new KampylosCpuPatchPool(4);
+    static KampylosCpuPatchPool& patch_pool = *new KampylosCpuPatchPool(KAMPYLOS_PATCH_THREADS);
     patch_pool.complete_batch(results, points, m->h_data.data(), s, q, chi2, m->fs_bound, m->flux_offset);
     return chi2;
+}
+
+std::vector<double> metal_fit_eval_chi2(MetalFitContext& ctx, double s, double q, const std::vector<Candidate>& points) {
+    return metal_eval_batch(ctx, s, q, points);
+}
+
+long metal_fit_buffers_retried(const MetalFitContext& ctx) {
+    return ((const MetalFitImpl*)ctx.impl)->buffers_retried;
 }
 
 BinaryFitResult metal_fit_binary_seeds(

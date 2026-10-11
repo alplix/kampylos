@@ -67,6 +67,13 @@
 #include <condition_variable>
 #include "kampylos_gpu_complete.h"
 
+// Worker threads for the completion step. The default is only safe with the thread_local-patched
+// VBMicrolensing described above; build with -DKAMPYLOS_PATCH_THREADS=1 against an unpatched copy
+// of the library (upstream v5.6 crashes with heap corruption within the first batch otherwise).
+#ifndef KAMPYLOS_PATCH_THREADS
+#define KAMPYLOS_PATCH_THREADS 4
+#endif
+
 class KampylosCpuPatchPool {
 public:
     explicit KampylosCpuPatchPool(int n_threads = 4)
