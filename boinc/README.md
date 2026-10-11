@@ -25,3 +25,10 @@ g++ main.o vbm.o <boinc>/api/libboinc_api.a <boinc>/lib/libboinc.a -lpthread -o 
 
 Run it in a directory with the two input files the app expects, `in` (one line, see `src/kampylos_wu.h`) and
 `photometry` (the event's light curve); it writes `out`. Outside a BOINC client it runs standalone.
+
+## VBMicrolensing
+
+`vendor/VBMicrolensing` is a fork of valboz/VBMicrolensing v5.6 (`alplix/VBMicrolensing`, branch `thread-safe-statics`) in
+which every function-local `static` is `thread_local` and `VBM_THREAD_SAFE` is defined. The GPU backends run the exact
+finite-source completion on several CPU threads (`src/kampylos_cpu_patch_pool.h`); with the unpatched upstream library the pool
+falls back to a single thread because upstream's statics are shared between threads.
