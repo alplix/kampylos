@@ -19,17 +19,27 @@ CXX=${CXX:-c++}
 mkdir -p "$WORK"
 cd "$WORK"
 
-echo "== building the CPU wrapper against tests/boinc_stub"
-$CXX -O2 -std=c++17 -I "$ROOT/src" -I "$VBM" -I "$ROOT/tests/boinc_stub" \
-    "$ROOT/boinc/main_kampylos_boinc.cpp" "$ROOT/tests/boinc_stub/boinc_stub.cpp" "$VBM/VBMicrolensingLibrary.cpp" \
-    -o kampylos_stub 2>&1 | grep -v VBMicrolensingLibrary || true
+# KAMPYLOS_RESUME_BACKEND=metal runs the same test against the Metal wrapper (macOS only), which
+# exercises the batched driver's in-cell checkpoint instead of the CPU app's seed checkpoint.
+BACKEND=${KAMPYLOS_RESUME_BACKEND:-cpu}
+echo "== building the $BACKEND wrapper against tests/boinc_stub"
+if [ "$BACKEND" = metal ]; then
+    $CXX -O2 -std=c++17 -fobjc-arc -I "$ROOT/src" -I "$VBM" -I "$ROOT/tests/boinc_stub" \
+        "$ROOT/boinc/main_kampylos_metal_boinc.cpp" "$ROOT/src/kampylos_metal_fit.mm" \
+        "$ROOT/tests/boinc_stub/boinc_stub.cpp" "$VBM/VBMicrolensingLibrary.cpp" \
+        -framework Metal -framework Foundation -o kampylos_stub 2>&1 | grep -v VBMicrolensingLibrary || true
+else
+    $CXX -O2 -std=c++17 -I "$ROOT/src" -I "$VBM" -I "$ROOT/tests/boinc_stub" \
+        "$ROOT/boinc/main_kampylos_boinc.cpp" "$ROOT/tests/boinc_stub/boinc_stub.cpp" "$VBM/VBMicrolensingLibrary.cpp" \
+        -o kampylos_stub 2>&1 | grep -v VBMicrolensingLibrary || true
+fi
 test -x kampylos_stub
 
 awk 'NR % 7 == 1' "$ROOT/tests/regression/synthetic_planet.dat" > photometry
 echo "flux 0.2 0.2 1 -3.2 -3 2 log10" > in
 export KAMPYLOS_STUB_CHECKPOINT_SECONDS=0
 
-fresh() { rm -f out kampylos_checkpoint kampylos_seed_checkpoint stub_checkpoints stub_fraction_done; }
+fresh() { rm -f out kampylos_checkpoint kampylos_seed_checkpoint kampylos_batched_checkpoint stub_checkpoints stub_fraction_done; }
 
 echo "== reference run (uninterrupted)"
 fresh
@@ -52,7 +62,10 @@ while :; do
     if kill -0 $pid 2>/dev/null; then
         kill -9 $pid; wait $pid 2>/dev/null || true
         lines=$(awk '!/^#/ { n++ } END { print n + 0 }' out 2>/dev/null || echo 0)
-        echo "   attempt $attempt: killed after ${delay}s ($lines cell lines, seed checkpoint: $(cut -c1-12 kampylos_seed_checkpoint 2>/dev/null || echo none))"
+        if [ -f kampylos_seed_checkpoint ]; then cp_info="seed checkpoint: $(cut -c1-12 kampylos_seed_checkpoint)"
+        elif [ -f kampylos_batched_checkpoint ]; then cp_info="in-cell checkpoint (cell seeds restarts pass round): $(sed -n 2p kampylos_batched_checkpoint)"
+        else cp_info="no in-cell checkpoint"; fi
+        echo "   attempt $attempt: killed after ${delay}s ($lines cell lines, $cp_info)"
         if [ $deleted_checkpoint -eq 0 ] && [ -f kampylos_checkpoint ] && [ "$(cat kampylos_checkpoint)" -ge 1 ]; then
             rm kampylos_checkpoint; deleted_checkpoint=1
             echo "   (deleted the cell checkpoint file to force a resume from the output file)"

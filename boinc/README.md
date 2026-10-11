@@ -37,12 +37,16 @@ Two files in the slot directory, both written atomically (temporary file + renam
 |---|---|
 | `kampylos_checkpoint` | number of grid cells completed and written to `out`; written after every cell |
 | `kampylos_seed_checkpoint` | CPU app only: cell index, next seed, best fit so far (`src/kampylos_cpu_cell.h`); written whenever BOINC asks for a checkpoint, removed when the cell completes |
+| `kampylos_batched_checkpoint` | GPU apps only: the batched Nelder-Mead driver's full state between two rounds (`src/kampylos_batched_fit.h`), a few hundred KB of text; same timing as the seed checkpoint |
 
 On a restart the app resumes from `min(kampylos_checkpoint, complete lines in out)`; the result file is the
-authoritative record of finished cells, so a missing or stale checkpoint file never costs a finished cell.
+authoritative record of finished cells, so a missing or stale checkpoint file never costs a finished cell. Inside a
+cell both the CPU and the GPU apps resume bit-identically, and report progress after every seed / every round.
 
 ## Tests
 
 - `tests/test_cpu_resume.cpp` -- the resumable seed loop and the result-file helpers (seconds).
+- `tests/test_batched_resume.cpp` -- the GPU apps' driver, with a CPU evaluator: state round trip, kills at random
+  rounds across all passes, bit-identical resume (a few minutes).
 - `tests/test_boinc_resume.sh` -- builds the real CPU wrapper against the fake BOINC runtime in `tests/boinc_stub/`,
   kills it with SIGKILL at random moments and checks the resumed `out` is byte-identical to an uninterrupted run (minutes).

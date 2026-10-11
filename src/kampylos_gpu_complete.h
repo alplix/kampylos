@@ -39,8 +39,17 @@ inline CompletedFit kampylos_complete_candidate(
     double rho = exp(c.log_rho);
     double salpha = sin(c.alpha), calpha = cos(c.alpha);
 
-    for (int k = 0; k < r.n_bad; k++) {
-        int i = r.bad_idx[k];
+    // The kernel appends bad points in whatever order its threads reach the atomic counter, which
+    // varies from launch to launch; adding them to the sums in index order instead makes a
+    // candidate's chi2 reproducible run to run (and a resumed cell identical to an uninterrupted
+    // one, see kampylos_batched_fit.h).
+    int bad[KAMPYLOS_MAX_BAD_POINTS];
+    int n_bad = std::min(r.n_bad, (int)KAMPYLOS_MAX_BAD_POINTS);
+    for (int k = 0; k < n_bad; k++) bad[k] = r.bad_idx[k];
+    std::sort(bad, bad + n_bad);
+
+    for (int k = 0; k < n_bad; k++) {
+        int i = bad[k];
         double t = data[i].t;
         double tn = (t - c.t0) * tE_inv;
         double y1 = c.u0 * salpha - tn * calpha;

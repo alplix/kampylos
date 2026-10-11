@@ -30,6 +30,7 @@
 #include <vector>
 #include <algorithm>
 #include "../src/kampylos_cpu_cell.h"   // seed checkpoint format (Kampylos headers first, see above)
+#include "../src/kampylos_batched_fit.h" // KampylosBatchedHooks (GPU apps' in-cell checkpoint)
 #include "boinc_api.h"
 #include "filesys.h"
 
@@ -86,6 +87,29 @@ static bool kampylos_write_seed_checkpoint(const KampylosSeedCheckpoint &cp) {
 static void kampylos_remove_seed_checkpoint() {
     char path[512];
     if (boinc_resolve_filename(KAMPYLOS_SEED_CHECKPOINT_NAME, path, sizeof(path))) return;
+    boinc_delete_file(path);
+}
+
+// The GPU apps' in-cell checkpoint (the batched driver's state, see src/kampylos_batched_fit.h):
+// a few hundred KB of text, written whenever BOINC asks for a checkpoint, same atomic write.
+static const char *KAMPYLOS_BATCHED_CHECKPOINT_NAME = "kampylos_batched_checkpoint";
+
+static bool kampylos_read_batched_checkpoint(std::string &text) {
+    char path[512];
+    if (boinc_resolve_filename(KAMPYLOS_BATCHED_CHECKPOINT_NAME, path, sizeof(path))) return false;
+    FILE *f = boinc_fopen(path, "rb");
+    if (!f) return false;
+    text.clear();
+    char buf[65536];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), f)) > 0) text.append(buf, n);
+    fclose(f);
+    return !text.empty();
+}
+
+static void kampylos_remove_batched_checkpoint() {
+    char path[512];
+    if (boinc_resolve_filename(KAMPYLOS_BATCHED_CHECKPOINT_NAME, path, sizeof(path))) return;
     boinc_delete_file(path);
 }
 
@@ -198,6 +222,7 @@ static void kampylos_boinc_after_cell(int done, int total) {
     if (!kampylos_write_checkpoint(done))
         fprintf(stderr, "warning: could not write the cell checkpoint after cell %d\n", done);
     kampylos_remove_seed_checkpoint();
+    kampylos_remove_batched_checkpoint();
     boinc_checkpoint_completed();
 }
 
@@ -221,6 +246,23 @@ inline KampylosCellHooks kampylos_boinc_cell_hooks(int cell, int total) {
     h.write_checkpoint = [](const KampylosSeedCheckpoint &cp) {
         if (!kampylos_write_seed_checkpoint(cp))
             fprintf(stderr, "warning: could not write the seed checkpoint (cell %d, seed %lu)\n", cp.cell, (unsigned long)cp.next);
+    };
+    h.time_to_checkpoint = []() { return boinc_time_to_checkpoint() != 0; };
+    h.checkpoint_completed = []() { boinc_checkpoint_completed(); };
+    h.progress = [cell, total](double own) { boinc_fraction_done((cell + own) / (double)total); };
+    h.keep_going = nullptr;
+    return h;
+}
+
+// The GPU apps' in-cell checkpoint and progress, mapped onto the BOINC API the same way (see
+// src/kampylos_batched_fit.h). The wrappers pass this and the cell index to their backend's
+// *_fit_binary_seeds().
+inline KampylosBatchedHooks kampylos_boinc_batched_hooks(int cell, int total) {
+    KampylosBatchedHooks h;
+    h.read_checkpoint = [](std::string &text) { return kampylos_read_batched_checkpoint(text); };
+    h.write_checkpoint = [](const std::string &text) {
+        if (!kampylos_write_file_atomic(KAMPYLOS_BATCHED_CHECKPOINT_NAME, text))
+            fprintf(stderr, "warning: could not write the in-cell checkpoint\n");
     };
     h.time_to_checkpoint = []() { return boinc_time_to_checkpoint() != 0; };
     h.checkpoint_completed = []() { boinc_checkpoint_completed(); };

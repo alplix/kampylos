@@ -9,6 +9,7 @@
 #include <vector>
 #include "binary_fit.h" // BinaryFitResult
 #include "lightcurve.h" // DataPoint
+#include "kampylos_batched_fit.h" // KampylosBatchedHooks
 
 struct MetalFitContext {
     void* impl; // MetalFitImpl* (Objective-C++ types -- MTLDevice/MTLCommandQueue/... -- live
@@ -30,12 +31,15 @@ class VBMicrolensing;
 // Metal twin of gpu_fit_binary_seeds() (see gpu_fit_binary.h): runs every seed of a
 // kampylos_make_seeds() set at one grid cell, ln_s/ln_q natural logs; the work-unit driver
 // recomputes chi2/fs/fb exactly on the host afterwards.
+// hooks/cell: optional in-cell checkpointing and progress (kampylos_batched_fit.h).
 BinaryFitResult metal_fit_binary_seeds(
     MetalFitContext& ctx,
     const std::vector<DataPoint>& data,
     double ln_s, double ln_q,
     const BinarySeedSet& seeds,
-    int n_restarts = 2
+    int n_restarts = 2,
+    const KampylosBatchedHooks* hooks = nullptr,
+    int cell = 0
 );
 
 // Legacy entry point (unit tests): the 96-seed multistart around one anchor.

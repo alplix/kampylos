@@ -13,6 +13,10 @@
 // Validated (tests/test_nelder_mead_stepper.cpp) to reach the IDENTICAL final point/value as
 // simplex.h's own nelder_mead() on the same problems -- this is a refactor of a proven algorithm,
 // not a new one, so that equivalence is the thing that actually needs checking, not the math.
+//
+// The complete state is exposed (State / state() / the State constructor) so a batch of
+// steppers can be checkpointed between rounds and resumed bit-identically
+// (kampylos_batched_fit.h, tests/test_batched_resume.cpp).
 #include <vector>
 #include <algorithm>
 #include <cmath>
@@ -36,7 +40,30 @@ public:
         pending = simplex; // NeedInit: caller must evaluate all n1 vertices, in simplex order
     }
 
+    // Everything needed to continue a search from exactly where it was.
+    struct State {
+        int n = 0, max_iter = 0, iter = 0, phase = 0;
+        double ftol = 0, xtol = 0, fr = 0;
+        bool converged = false;
+        std::vector<std::vector<double>> simplex, pending;
+        std::vector<double> fval, centroid, worst, xr, xe, xc;
+    };
+    State state() const {
+        State s;
+        s.n = n; s.max_iter = max_iter; s.iter = iter; s.phase = (int)phase;
+        s.ftol = ftol; s.xtol = xtol; s.fr = fr; s.converged = converged;
+        s.simplex = simplex; s.pending = pending; s.fval = fval;
+        s.centroid = centroid; s.worst = worst; s.xr = xr; s.xe = xe; s.xc = xc;
+        return s;
+    }
+    explicit NelderMeadStepper(const State& s)
+        : n(s.n), n1(s.n + 1), max_iter(s.max_iter), ftol(s.ftol), xtol(s.xtol),
+          simplex(s.simplex), fval(s.fval), pending(s.pending), phase((NMPhase)s.phase), iter(s.iter), converged(s.converged),
+          centroid(s.centroid), worst(s.worst), xr(s.xr), xe(s.xe), xc(s.xc), fr(s.fr) {}
+
     bool done() const { return phase == NMPhase::Done; }
+    int iterations() const { return iter; }
+    int max_iterations() const { return max_iter; }
 
     // Points this instance needs evaluated right now, in the order submit_results() expects
     // their values back.
