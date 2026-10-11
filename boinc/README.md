@@ -69,3 +69,11 @@ cell both the CPU and the GPU apps resume bit-identically, and report progress a
   rounds across all passes, bit-identical resume (a few minutes).
 - `tests/test_boinc_resume.sh` -- builds the real CPU wrapper against the fake BOINC runtime in `tests/boinc_stub/`,
   kills it with SIGKILL at random moments and checks the resumed `out` is byte-identical to an uninterrupted run (minutes).
+
+## VBMicrolensing
+
+`vendor/VBMicrolensing` is a fork of valboz/VBMicrolensing v5.6 (`alplix/VBMicrolensing`, branch `thread-safe-statics`) in
+which every function-local `static` is `thread_local` and `VBM_THREAD_SAFE` is defined. The GPU backends run the exact
+finite-source completion on several CPU threads (`src/kampylos_cpu_patch_pool.h`); with the unpatched upstream library the pool
+falls back to a single thread because upstream's statics are shared between threads. To build against plain upstream v5.6
+instead, run `python3 vendor/patch_vbm_thread_local.py` (it recognises the fork as already patched).

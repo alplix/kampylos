@@ -66,7 +66,7 @@ static std::vector<double> gpu_eval_batch(
     // static` (243 of them). Verified real-hardware-safe (see kampylos_cpu_patch_pool.h's own
     // history note) before this file was changed back to use it.
     // Created once, never destroyed: see kampylos_cpu_patch_pool.h (persistent workers).
-    static KampylosCpuPatchPool& patch_pool = *new KampylosCpuPatchPool(4);
+    static KampylosCpuPatchPool& patch_pool = *new KampylosCpuPatchPool();   // default: 4 threads with the thread_local VBMicrolensing, else 1
     patch_pool.complete_batch(h_res, points, ctx.h_data.data(), s, q, chi2, ctx.fs_bound, ctx.flux_offset);
     return chi2;
 }

@@ -43,7 +43,8 @@ def main():
         return 2
     hdr = open(HDR).read()
     cpp = open(CPP).read()
-    patched = MARK in hdr and "thread_local static" in cpp
+    # the alplix/VBMicrolensing fork (the submodule) defines VBM_THREAD_SAFE instead of our marker
+    patched = (MARK in hdr or "VBM_THREAD_SAFE" in hdr) and "thread_local static" in cpp
     if check_only:
         print("patched" if patched else "NOT patched")
         return 0 if patched else 1

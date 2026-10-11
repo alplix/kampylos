@@ -1,3 +1,4 @@
 [submodule "vendor/VBMicrolensing"]
 	path = vendor/VBMicrolensing
-	url = https://github.com/valboz/VBMicrolensing.git
+	url = https://github.com/alplix/VBMicrolensing.git
+	branch = thread-safe-statics

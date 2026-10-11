@@ -39,7 +39,7 @@ static void evaluate(const std::vector<Trial>& t, std::vector<double>& out) {
 
 int main(int argc, char** argv) {
     const int n_threads = 4, n_trials = argc > 1 ? atoi(argv[1]) : 3000;
-#ifdef VBM_THREAD_LOCAL_STATICS
+#if defined(VBM_THREAD_LOCAL_STATICS) || defined(VBM_THREAD_SAFE)
     printf("library reports VBM_THREAD_LOCAL_STATICS\n");
 #else
     printf("library is NOT patched (VBM_THREAD_LOCAL_STATICS undefined) -- expect a crash or mismatches\n");

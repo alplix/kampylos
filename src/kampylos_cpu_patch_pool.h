@@ -73,7 +73,7 @@
 // upstream submodule) automatically runs the completion step single-threaded instead of
 // corrupting the heap within the first batch. Override with -DKAMPYLOS_PATCH_THREADS=N.
 #ifndef KAMPYLOS_PATCH_THREADS
-#ifdef VBM_THREAD_LOCAL_STATICS
+#if defined(VBM_THREAD_LOCAL_STATICS) || defined(VBM_THREAD_SAFE)   // patch script / the alplix fork
 #define KAMPYLOS_PATCH_THREADS 4
 #else
 #define KAMPYLOS_PATCH_THREADS 1
