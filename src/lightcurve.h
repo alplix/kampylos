@@ -45,6 +45,10 @@ inline std::vector<DataPoint> load_photometry(const std::string& path, bool inpu
         }
         if (dp.sigma > 0 && std::isfinite(dp.flux)) out.push_back(dp);
     }
+    // Time order is assumed downstream (pspl_prefit.h's raw_peak_anchor takes the span from the
+    // first and last point and walks neighbours), and a file assembled from several sites or
+    // seasons need not be sorted. Stable, so equal times keep their file order.
+    std::stable_sort(out.begin(), out.end(), [](const DataPoint& a, const DataPoint& b) { return a.t < b.t; });
     return out;
 }
 

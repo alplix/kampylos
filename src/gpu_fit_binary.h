@@ -43,9 +43,12 @@ struct GpuFitContext {
         return true;
     }
 
+    // Same policy as gpu_fit_binary.cu's CUDA_CHECK_RT: a failed allocation or upload used to
+    // be printed and then used anyway (null device pointers into the kernel launch); stop here.
     static void check(cudaError_t e, const char* what) {
         if (e != cudaSuccess) {
             fprintf(stderr, "GpuFitContext: %s failed: %s\n", what, cudaGetErrorString(e));
+            exit(1);
         }
     }
 
