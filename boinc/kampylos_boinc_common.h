@@ -10,34 +10,83 @@
 // backend header) BEFORE this file: boinc_api.h drags in windows.h on Windows, whose macros
 // (e.g. "scr2") collide with names inside VBMicrolensingLibrary.h -- see the note in
 // main_kampylos_boinc.cpp.
+//
+// CHECKPOINTS (2026-10-10 rework). Two files in the slot directory:
+//   kampylos_checkpoint       one integer, the number of grid cells already completed and
+//                             written to "out" (row-major over (is, iq));
+//   kampylos_seed_checkpoint  the CPU app's progress inside the current cell (see
+//                             src/kampylos_cpu_cell.h).
+// Both are written to a temporary file and renamed into place, so a kill mid-write leaves the
+// previous checkpoint intact. The cell checkpoint is written after EVERY cell, inside a BOINC
+// critical section, not only when boinc_time_to_checkpoint() happens to be true: the CPU app's
+// seed loop consumes that flag after almost every seed, so the cell checkpoint used to be
+// skipped at most cell boundaries, and the next restart then threw away a finished cell.
+// On resume the result file is the authoritative record of finished cells (a line is only ever
+// written after its cell completed; a torn last line is dropped): the WU resumes from
+// min(checkpoint, complete lines) and never truncates an output that still has good lines --
+// a lost or stale checkpoint file costs nothing.
 #include <cstdio>
 #include <string>
 #include <vector>
+#include <algorithm>
+#include "../src/kampylos_cpu_cell.h"   // seed checkpoint format (Kampylos headers first, see above)
 #include "boinc_api.h"
 #include "filesys.h"
 
 static const char *KAMPYLOS_CHECKPOINT_NAME = "kampylos_checkpoint";
+static const char *KAMPYLOS_SEED_CHECKPOINT_NAME = "kampylos_seed_checkpoint";
 
-// Checkpoint format: a single integer, the number of grid cells already completed (and
-// therefore already written to "out"). Row-major over (is, iq).
+// Writes `content` to the resolved `name` atomically (temporary file + rename). Returns false if
+// the file could not be written, so the caller does not report a checkpoint that does not exist.
+static bool kampylos_write_file_atomic(const char *name, const std::string &content) {
+    char path[512];
+    if (boinc_resolve_filename(name, path, sizeof(path))) return false;
+    std::string tmp = std::string(path) + ".tmp";
+    FILE *f = boinc_fopen(tmp.c_str(), "w");
+    if (!f) return false;
+    bool ok = fwrite(content.data(), 1, content.size(), f) == content.size();
+    ok = (fclose(f) == 0) && ok;
+    if (!ok) return false;
+    return boinc_rename(tmp.c_str(), path) == 0;
+}
+
+// Cells completed according to the checkpoint file; -1 if there is none (or it is unreadable).
 static int kampylos_read_checkpoint() {
     char path[512];
-    if (boinc_resolve_filename(KAMPYLOS_CHECKPOINT_NAME, path, sizeof(path))) return 0;
+    if (boinc_resolve_filename(KAMPYLOS_CHECKPOINT_NAME, path, sizeof(path))) return -1;
     FILE *f = boinc_fopen(path, "r");
-    if (!f) return 0;
-    int done = 0;
-    if (fscanf(f, "%d", &done) != 1) done = 0;
+    if (!f) return -1;
+    int done = -1;
+    if (fscanf(f, "%d", &done) != 1) done = -1;
     fclose(f);
     return done;
 }
 
-static void kampylos_write_checkpoint(int done) {
+static bool kampylos_write_checkpoint(int done) {
+    return kampylos_write_file_atomic(KAMPYLOS_CHECKPOINT_NAME, std::to_string(done) + "\n");
+}
+
+static bool kampylos_read_seed_checkpoint(KampylosSeedCheckpoint &cp) {
     char path[512];
-    if (boinc_resolve_filename(KAMPYLOS_CHECKPOINT_NAME, path, sizeof(path))) return;
-    FILE *f = boinc_fopen(path, "w");
-    if (!f) return;
-    fprintf(f, "%d\n", done);
+    if (boinc_resolve_filename(KAMPYLOS_SEED_CHECKPOINT_NAME, path, sizeof(path))) return false;
+    FILE *f = boinc_fopen(path, "r");
+    if (!f) return false;
+    char buf[512] = {0};
+    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
     fclose(f);
+    return kampylos_parse_seed_checkpoint(std::string(buf, n), &cp);
+}
+
+static bool kampylos_write_seed_checkpoint(const KampylosSeedCheckpoint &cp) {
+    return kampylos_write_file_atomic(KAMPYLOS_SEED_CHECKPOINT_NAME, kampylos_format_seed_checkpoint(cp));
+}
+
+// The seed checkpoint only ever describes the cell it names; once that cell's line is in "out"
+// it is stale, and removing it keeps a later cell from ever reading it by mistake.
+static void kampylos_remove_seed_checkpoint() {
+    char path[512];
+    if (boinc_resolve_filename(KAMPYLOS_SEED_CHECKPOINT_NAME, path, sizeof(path))) return;
+    boinc_delete_file(path);
 }
 
 struct KampylosBoincJob {
@@ -100,18 +149,30 @@ static void kampylos_boinc_compute_anchor(KampylosBoincJob &job) {
     kampylos_log_anchor(stderr, job.anchor);
 }
 
-// Opens "out": fresh (header written) on a first run, trimmed back to the checkpointed cells on
-// a resume. Returns 0 on success.
+// Opens "out": fresh (header written) on a first run, trimmed back to the finished cells on a
+// resume. Returns 0 on success.
 static int kampylos_boinc_open_output(KampylosBoincJob &job, const char *backend) {
     char out_path[512];
     if (boinc_resolve_filename("out", out_path, sizeof(out_path))) {
         fprintf(stderr, "can't resolve output file 'out'\n");
         return 1;
     }
-    job.start_cell = kampylos_read_checkpoint();
-    if (job.start_cell < 0 || job.start_cell > job.total) job.start_cell = 0;
+    int checkpoint = kampylos_read_checkpoint();                 // -1: none
+    int have = kampylos_count_complete_cells(out_path);           // -1: no usable output yet
+    job.start_cell = 0;
+    if (have >= 0) {
+        job.start_cell = (checkpoint >= 0) ? std::min(checkpoint, have) : have;
+        job.start_cell = std::min(job.start_cell, job.total);
+        if (checkpoint > have)
+            fprintf(stderr, "checkpoint says %d cells done but the output file holds %d complete cells -- resuming from %d\n",
+                    checkpoint, have, job.start_cell);
+        else if (checkpoint < 0 && have > 0)
+            fprintf(stderr, "no checkpoint file; the output file holds %d complete cells -- resuming from there\n", have);
+    } else if (checkpoint > 0) {
+        fprintf(stderr, "checkpoint says %d cells done but there is no usable output file -- restarting from cell 0\n", checkpoint);
+    }
     if (job.start_cell > 0 && !kampylos_trim_output(out_path, job.start_cell)) {
-        fprintf(stderr, "checkpoint says %d cells done but the output file doesn't match -- restarting from cell 0\n", job.start_cell);
+        fprintf(stderr, "could not trim the output file to %d cells -- restarting from cell 0\n", job.start_cell);
         job.start_cell = 0;
     }
     fprintf(stderr, "Resuming from cell %d/%d\n", job.start_cell, job.total);
@@ -127,12 +188,17 @@ static int kampylos_boinc_open_output(KampylosBoincJob &job, const char *backend
     return 0;
 }
 
+// Called after each cell's line has been written and flushed: progress, then the cell
+// checkpoint -- always, not only when boinc_time_to_checkpoint() says so (see the top comment).
+// boinc_checkpoint_completed() ends the critical section and tells the client where the task
+// can be restarted from.
 static void kampylos_boinc_after_cell(int done, int total) {
     boinc_fraction_done((double)done / (double)total);
-    if (boinc_time_to_checkpoint()) {
-        kampylos_write_checkpoint(done);
-        boinc_checkpoint_completed();
-    }
+    boinc_begin_critical_section();
+    if (!kampylos_write_checkpoint(done))
+        fprintf(stderr, "warning: could not write the cell checkpoint after cell %d\n", done);
+    kampylos_remove_seed_checkpoint();
+    boinc_checkpoint_completed();
 }
 
 // Runs every remaining cell with `fit_cell` and finishes the WU.
@@ -141,8 +207,24 @@ static int kampylos_boinc_run(KampylosBoincJob &job, VBMicrolensing &vbm, FitCel
     kampylos_run_cells(job.fout, stderr, job.in, job.data, job.anchor, vbm, job.start_cell, job.total,
                        fit_cell, kampylos_boinc_after_cell);
     fclose(job.fout);
-    kampylos_write_checkpoint(job.total);
     boinc_fraction_done(1.0);
     boinc_finish(0);
     return 0;
+}
+
+// The CPU app's seed-level checkpoint, mapped onto the BOINC API (see src/kampylos_cpu_cell.h).
+// boinc_time_to_checkpoint() opens a critical section when it returns true and
+// boinc_checkpoint_completed() closes it, so the client cannot stop the task between the two.
+inline KampylosCellHooks kampylos_boinc_cell_hooks(int cell, int total) {
+    KampylosCellHooks h;
+    h.read_checkpoint = [](KampylosSeedCheckpoint &cp) { return kampylos_read_seed_checkpoint(cp); };
+    h.write_checkpoint = [](const KampylosSeedCheckpoint &cp) {
+        if (!kampylos_write_seed_checkpoint(cp))
+            fprintf(stderr, "warning: could not write the seed checkpoint (cell %d, seed %lu)\n", cp.cell, (unsigned long)cp.next);
+    };
+    h.time_to_checkpoint = []() { return boinc_time_to_checkpoint() != 0; };
+    h.checkpoint_completed = []() { boinc_checkpoint_completed(); };
+    h.progress = [cell, total](double own) { boinc_fraction_done((cell + own) / (double)total); };
+    h.keep_going = nullptr;
+    return h;
 }

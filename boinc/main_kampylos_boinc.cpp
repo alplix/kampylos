@@ -12,6 +12,11 @@
 // v2 (2026-10-08): log10 grid marker, exact (unregularized) flux fit, PSPL/FSPL/FSPL+LD anchor
 // in the result file, single-lens-reproducing seeds, per-cell few-points diagnostics. Shared
 // plumbing lives in kampylos_boinc_common.h; this file only picks the CPU fitter.
+//
+// v3 (2026-10-09, forum threads 72 and 87): a CPU task is often ONE grid cell, and one cell can run
+// for many hours, while the only checkpoint was between cells. The seed loop now lives in
+// src/kampylos_cpu_cell.h with progress after every seed and a seed-level checkpoint; this file
+// only maps its hooks onto the BOINC API (kampylos_boinc_cell_hooks).
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -27,45 +32,15 @@
 // real BOINC API functions), so including them in this order avoids the collision entirely
 // instead of patching vendored third-party source to dodge windows.h's namespace pollution.
 #include "../src/kampylos_wu.h"
+#include "../src/kampylos_cpu_cell.h"
 
 #include "kampylos_boinc_common.h"
 
+// The version printed to stderr. Build with -DKAMPYLOS_VERSION='"12"' so it matches the
+// version_num the server assigns to the binary; the default is only a fallback.
+#ifndef KAMPYLOS_VERSION
 #define KAMPYLOS_VERSION "4"
-
-// v3 (2026-10-09, forum threads 72 and 87): a CPU task is often ONE grid cell, and one cell can run
-// for many hours (dozens of seeds x a restart-backed simplex over thousands of data points), while
-// the only checkpoint was between cells -- so a restart lost everything and progress sat at the
-// client's estimate (99.99%) for hours. Now the seed loop of fit_binary_seeds() runs here with
-// progress after every seed and a seed-level checkpoint: cell index, next seed, best fit so far
-// (%.17g, so the doubles round-trip exactly). Seeds are deterministic and the best chi2 wins, so a
-// resumed cell gives exactly the uninterrupted result. The checkpoint is only used for the cell it
-// names; if the cell checkpoint is older, the cell is simply redone.
-static const char *SEED_CHECKPOINT_NAME = "kampylos_seed_checkpoint";
-
-static bool read_seed_checkpoint(int *cell, size_t *next, BinaryFitResult *best) {
-    char path[512];
-    if (boinc_resolve_filename(SEED_CHECKPOINT_NAME, path, sizeof(path))) return false;
-    FILE *f = boinc_fopen(path, "r");
-    if (!f) return false;
-    unsigned long nx = 0;
-    bool ok = fscanf(f, "%d %lu %lf %lf %lf %lf %lf %lf %lf %lf %lf %lf", cell, &nx, &best->log_s, &best->log_q,
-                     &best->t0, &best->u0, &best->tE, &best->alpha, &best->rho, &best->fs, &best->fb, &best->chi2) == 12;
-    fclose(f);
-    *next = nx;
-    return ok;
-}
-
-static void write_seed_checkpoint(int cell, size_t next, const BinaryFitResult &b) {
-    char path[512];
-    if (boinc_resolve_filename(SEED_CHECKPOINT_NAME, path, sizeof(path))) return;
-    std::string tmp = std::string(path) + ".tmp";
-    FILE *f = boinc_fopen(tmp.c_str(), "w");
-    if (!f) return;
-    fprintf(f, "%d %lu %.17g %.17g %.17g %.17g %.17g %.17g %.17g %.17g %.17g %.17g\n", cell, (unsigned long)next,
-            b.log_s, b.log_q, b.t0, b.u0, b.tE, b.alpha, b.rho, b.fs, b.fb, b.chi2);
-    fclose(f);
-    boinc_rename(tmp.c_str(), path);
-}
+#endif
 
 int main(int argc, char **argv) {
     (void)argc; (void)argv;
@@ -93,37 +68,9 @@ int main(int argc, char **argv) {
     VBMicrolensing vbm;
     int cell = job.start_cell;   // cells are fitted in order, one call per cell
     return kampylos_boinc_run(job, vbm, [&](double ln_s, double ln_q, const BinarySeedSet &seeds) {
-        // same loop as fit_binary_seeds() (vendor/kampylos/src/binary_fit.h), with progress and
-        // a seed-level checkpoint
-        const size_t n = seeds.x0.size();
-        BinaryFitResult best;
-        best.chi2 = 1e300;
-        size_t k0 = 0;
-        int cp_cell;
-        size_t cp_next;
-        BinaryFitResult cp_best;
-        if (read_seed_checkpoint(&cp_cell, &cp_next, &cp_best) && cp_cell == cell && cp_next <= n) {
-            best = cp_best;
-            k0 = cp_next;
-            fprintf(stderr, "resuming cell %d at seed %lu of %lu\n", cell, (unsigned long)k0, (unsigned long)n);
-        }
-        // v12: "part i K" in the input line = this work unit fits only the seeds with k % K == i (interleaved,
-        // so the K parts cost about the same); the server keeps the lowest chi2 per cell over the K results.
-        const size_t K = (size_t)job.in.nparts, part = (size_t)job.in.part;
-        size_t own_total = 0, own_before = 0;
-        for (size_t k = 0; k < n; k++) if (k % K == part) { own_total++; if (k < k0) own_before++; }
-        size_t own_done = own_before;
-        for (size_t k = k0; k < n; k++) {
-            if (k % K != part) continue;
-            BinaryFitResult r = fit_binary_local_steps(vbm, job.data, ln_s, ln_q, seeds.x0[k], seeds.step[k]);
-            if (r.chi2 < best.chi2) best = r;
-            own_done++;
-            boinc_fraction_done((cell + (double)own_done / (double)(own_total ? own_total : 1)) / (double)job.total);
-            if (boinc_time_to_checkpoint()) {
-                write_seed_checkpoint(cell, k + 1, best);
-                boinc_checkpoint_completed();
-            }
-        }
+        KampylosCellHooks hooks = kampylos_boinc_cell_hooks(cell, job.total);
+        BinaryFitResult best = kampylos_fit_cell_resumable(vbm, job.data, ln_s, ln_q, seeds, cell,
+                                                           job.in.part, job.in.nparts, hooks, stderr);
         cell++;
         return best;
     });
