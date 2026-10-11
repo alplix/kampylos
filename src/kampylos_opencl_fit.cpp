@@ -15,6 +15,7 @@
 #endif
 #include <algorithm>
 #include <cctype>
+#include <stdexcept>
 #include "kampylos_gpu_types.h"
 #include "kampylos_gpu_complete.h"
 #include "kampylos_cpu_patch_pool.h"
@@ -33,6 +34,8 @@
 static bool platform_vendor_matches(cl_platform_id p) {
     return cl_platform_matches_vendor(p, EXPECTED_GPU_VENDOR) != 0;
 }
+
+[[noreturn]] static void opencl_fail(const char* what, cl_int err);
 
 OpenCLFitContext::~OpenCLFitContext() {
     if (d_data) cl_api.ReleaseMemObject(d_data);
@@ -125,7 +128,21 @@ void opencl_fit_upload_light_curve(OpenCLFitContext& ctx, const std::vector<Data
     cl_int err;
     ctx.d_data = cl_api.CreateBuffer(ctx.context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
         ctx.h_data.size() * sizeof(LightCurvePoint), ctx.h_data.data(), &err);
+    if (!ctx.d_data) opencl_fail("clCreateBuffer(light curve)", err);
 }
+
+// Every OpenCL call's return code is checked (2026-10-10): a failed write, launch or read used
+// to go unnoticed, the stale d_res from the previous round was read back as if it were this
+// round's result and the fit went on with it. A failure is reported with its code and raised as
+// std::runtime_error; the wrappers turn that into a clean exit (BOINC restarts the task from its
+// checkpoint) rather than a cell computed from garbage.
+[[noreturn]] static void opencl_fail(const char* what, cl_int err) {
+    char buf[200];
+    snprintf(buf, sizeof(buf), "%s failed with OpenCL error %d", what, (int)err);
+    fprintf(stderr, "opencl_fit: %s\n", buf);
+    throw std::runtime_error(buf);
+}
+#define CL_CHECK(what, call) do { cl_int _e = (call); if (_e != CL_SUCCESS) opencl_fail(what, _e); } while (0)
 
 static void ensure_cand_capacity(OpenCLFitContext& ctx, int n) {
     if (n <= ctx.cand_capacity) return;
@@ -133,7 +150,9 @@ static void ensure_cand_capacity(OpenCLFitContext& ctx, int n) {
     if (ctx.d_res) cl_api.ReleaseMemObject(ctx.d_res);
     cl_int err;
     ctx.d_cand = cl_api.CreateBuffer(ctx.context, CL_MEM_READ_ONLY, n * sizeof(Candidate), NULL, &err);
+    if (!ctx.d_cand) opencl_fail("clCreateBuffer(candidates)", err);
     ctx.d_res = cl_api.CreateBuffer(ctx.context, CL_MEM_WRITE_ONLY, n * sizeof(CandidateResult), NULL, &err);
+    if (!ctx.d_res) opencl_fail("clCreateBuffer(results)", err);
     ctx.cand_capacity = n;
 }
 
@@ -146,34 +165,37 @@ static std::vector<double> opencl_eval_batch(
     if (n == 0) return chi2;
 
     ensure_cand_capacity(ctx, n);
-    cl_api.EnqueueWriteBuffer(ctx.queue, ctx.d_cand, CL_TRUE, 0, n * sizeof(Candidate), points.data(), 0, NULL, NULL);
+    CL_CHECK("clEnqueueWriteBuffer(candidates)",
+             cl_api.EnqueueWriteBuffer(ctx.queue, ctx.d_cand, CL_TRUE, 0, n * sizeof(Candidate), points.data(), 0, NULL, NULL));
 
     int local_size = 128;
     size_t sh_bytes = 7 * local_size * sizeof(double);
-    cl_api.SetKernelArg(ctx.kernel, 0, sizeof(cl_mem), &ctx.d_data);
-    cl_api.SetKernelArg(ctx.kernel, 1, sizeof(int), &ctx.n_points);
-    cl_api.SetKernelArg(ctx.kernel, 2, sizeof(double), &s);   // linear s, q (2026-10-08)
-    cl_api.SetKernelArg(ctx.kernel, 3, sizeof(double), &q);
-    cl_api.SetKernelArg(ctx.kernel, 4, sizeof(cl_mem), &ctx.d_cand);
-    cl_api.SetKernelArg(ctx.kernel, 5, sizeof(int), &n);
-    cl_api.SetKernelArg(ctx.kernel, 6, sizeof(cl_mem), &ctx.d_res);
-    cl_api.SetKernelArg(ctx.kernel, 7, sh_bytes, NULL);
-    cl_api.SetKernelArg(ctx.kernel, 8, sizeof(int), NULL);
-    cl_api.SetKernelArg(ctx.kernel, 9, sizeof(int), NULL);
+    CL_CHECK("clSetKernelArg(0)", cl_api.SetKernelArg(ctx.kernel, 0, sizeof(cl_mem), &ctx.d_data));
+    CL_CHECK("clSetKernelArg(1)", cl_api.SetKernelArg(ctx.kernel, 1, sizeof(int), &ctx.n_points));
+    CL_CHECK("clSetKernelArg(2)", cl_api.SetKernelArg(ctx.kernel, 2, sizeof(double), &s));   // linear s, q (2026-10-08)
+    CL_CHECK("clSetKernelArg(3)", cl_api.SetKernelArg(ctx.kernel, 3, sizeof(double), &q));
+    CL_CHECK("clSetKernelArg(4)", cl_api.SetKernelArg(ctx.kernel, 4, sizeof(cl_mem), &ctx.d_cand));
+    CL_CHECK("clSetKernelArg(5)", cl_api.SetKernelArg(ctx.kernel, 5, sizeof(int), &n));
+    CL_CHECK("clSetKernelArg(6)", cl_api.SetKernelArg(ctx.kernel, 6, sizeof(cl_mem), &ctx.d_res));
+    CL_CHECK("clSetKernelArg(7)", cl_api.SetKernelArg(ctx.kernel, 7, sh_bytes, NULL));
+    CL_CHECK("clSetKernelArg(8)", cl_api.SetKernelArg(ctx.kernel, 8, sizeof(int), NULL));
+    CL_CHECK("clSetKernelArg(9)", cl_api.SetKernelArg(ctx.kernel, 9, sizeof(int), NULL));
 
     size_t global_size = (size_t)n * local_size;
     size_t local_size_t = (size_t)local_size;
-    cl_api.EnqueueNDRangeKernel(ctx.queue, ctx.kernel, 1, NULL, &global_size, &local_size_t, 0, NULL, NULL);
-    cl_api.Finish(ctx.queue);
+    CL_CHECK("clEnqueueNDRangeKernel", cl_api.EnqueueNDRangeKernel(ctx.queue, ctx.kernel, 1, NULL, &global_size, &local_size_t, 0, NULL, NULL));
+    CL_CHECK("clFinish", cl_api.Finish(ctx.queue));
 
     std::vector<CandidateResult> h_res(n);
-    cl_api.EnqueueReadBuffer(ctx.queue, ctx.d_res, CL_TRUE, 0, n * sizeof(CandidateResult), h_res.data(), 0, NULL, NULL);
+    CL_CHECK("clEnqueueReadBuffer(results)",
+             cl_api.EnqueueReadBuffer(ctx.queue, ctx.d_res, CL_TRUE, 0, n * sizeof(CandidateResult), h_res.data(), 0, NULL, NULL));
 
     // Same fix as gpu_fit_binary.cu's own gpu_eval_batch() (see that file and
     // kampylos_cpu_patch_pool.h for the full story) -- this loop was the same single-threaded
     // bottleneck for a pathological anchor, now spread across a small worker-thread pool instead.
-    // Created once, never destroyed: see kampylos_cpu_patch_pool.h (persistent workers).
-    static KampylosCpuPatchPool& patch_pool = *new KampylosCpuPatchPool(4);
+    // Created once, never destroyed: see kampylos_cpu_patch_pool.h (persistent workers; the
+    // thread count depends on whether the vendored VBMicrolensing is thread-safe).
+    static KampylosCpuPatchPool& patch_pool = *new KampylosCpuPatchPool();
     patch_pool.complete_batch(h_res, points, ctx.h_data.data(), s, q, chi2, ctx.fs_bound, ctx.flux_offset);
     return chi2;
 }

@@ -67,16 +67,22 @@
 #include <condition_variable>
 #include "kampylos_gpu_complete.h"
 
-// Worker threads for the completion step. The default is only safe with the thread_local-patched
-// VBMicrolensing described above; build with -DKAMPYLOS_PATCH_THREADS=1 against an unpatched copy
-// of the library (upstream v5.6 crashes with heap corruption within the first batch otherwise).
+// Default worker count. More than one thread is only safe with the thread_local-patched
+// VBMicrolensing described above; vendor/patch_vbm_thread_local.py applies that patch and
+// defines VBM_THREAD_LOCAL_STATICS in the library header, so an unpatched checkout (the plain
+// upstream submodule) automatically runs the completion step single-threaded instead of
+// corrupting the heap within the first batch. Override with -DKAMPYLOS_PATCH_THREADS=N.
 #ifndef KAMPYLOS_PATCH_THREADS
+#ifdef VBM_THREAD_LOCAL_STATICS
 #define KAMPYLOS_PATCH_THREADS 4
+#else
+#define KAMPYLOS_PATCH_THREADS 1
+#endif
 #endif
 
 class KampylosCpuPatchPool {
 public:
-    explicit KampylosCpuPatchPool(int n_threads = 4)
+    explicit KampylosCpuPatchPool(int n_threads = KAMPYLOS_PATCH_THREADS)
         : vbms_(std::max(1, n_threads)) {
         for (int t = 1; t < (int)vbms_.size(); t++) workers_.emplace_back([this, t]() { worker_loop(t); });
     }

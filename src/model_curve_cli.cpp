@@ -10,6 +10,7 @@
 // log10-grid work units (format 2, "# grid=log10") store log10 values -- the caller
 // (kampylos_lightcurve.php) converts them, multiplying by ln(10), before calling this.
 #include <cstdio>
+#include <cstdlib>
 #include <cmath>
 #include "VBMicrolensingLibrary.h"
 

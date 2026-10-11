@@ -101,8 +101,17 @@ int main(int argc, char **argv) {
     return kampylos_boinc_run(job, vbm, [&](double ln_s, double ln_q, const BinarySeedSet &seeds) {
         // in-cell checkpoint and progress, see kampylos_boinc_batched_hooks()
         KampylosBatchedHooks hooks = kampylos_boinc_batched_hooks(cell, job.total);
-        BinaryFitResult r = opencl_fit_binary_seeds(opencl_ctx, job.data, ln_s, ln_q, seeds, 2, &hooks, cell);
-        cell++;
-        return r;
+        try {
+            BinaryFitResult r = opencl_fit_binary_seeds(opencl_ctx, job.data, ln_s, ln_q, seeds, 2, &hooks, cell);
+            cell++;
+            return r;
+        } catch (const std::exception &e) {
+            // An OpenCL call failed (see opencl_fail in kampylos_opencl_fit.cpp): stop with the
+            // reason in stderr rather than write a cell computed from stale results. The client
+            // restarts the task from its last checkpoint.
+            fprintf(stderr, "opencl_fit_binary_seeds failed: %s\n", e.what());
+            boinc_finish(1);
+            return BinaryFitResult{};
+        }
     });
 }

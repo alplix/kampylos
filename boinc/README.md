@@ -14,7 +14,12 @@ work-unit files, progress, checkpointing and result upload.
 ## Build (CPU, Linux example)
 
 You need the BOINC client libraries (`libboinc_api`, `libboinc`) built for your target and the VBMicrolensing sources
-(`git submodule update --init`).
+(`git submodule update --init`, pinned to upstream v5.6).
+
+For the GPU apps (CUDA, OpenCL, Metal) also run `python3 vendor/patch_vbm_thread_local.py` once after the submodule
+checkout: it makes the library's function-local statics `thread_local`, which the completion step's worker threads
+need (`src/kampylos_cpu_patch_pool.h`). Without the patch the library header lacks `VBM_THREAD_LOCAL_STATICS` and the
+pool falls back to one thread automatically; `tests/test_vbm_threads.cpp` shows the difference.
 
 ```
 VBM=vendor/VBMicrolensing/VBMicrolensing/lib
