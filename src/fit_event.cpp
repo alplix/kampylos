@@ -5,6 +5,7 @@
 //   (default)            CPU   -- fit_binary_seeds()
 //   -DKAMPYLOS_CLI_CUDA   CUDA  -- gpu_fit_binary_seeds()     (link gpu_fit_binary.cu)
 //   -DKAMPYLOS_CLI_OPENCL OpenCL-- opencl_fit_binary_seeds()  (link kampylos_opencl_fit.cpp + cl_dynload.c)
+//   -DKAMPYLOS_CLI_METAL  Metal -- metal_fit_binary_seeds()   (link kampylos_metal_fit.mm, -framework Metal -framework Foundation)
 //
 // Usage:
 //   fit_event <photometry_file> <in_file> <out_file> [--cells FIRST:COUNT] [--device N] [--anchor-only]
@@ -24,6 +25,9 @@
 #elif defined(KAMPYLOS_CLI_OPENCL)
 #include "kampylos_opencl_fit.h"
 #define KAMPYLOS_CLI_BACKEND "opencl"
+#elif defined(KAMPYLOS_CLI_METAL)
+#include "kampylos_metal_fit.h"
+#define KAMPYLOS_CLI_BACKEND "metal"
 #else
 #define KAMPYLOS_CLI_BACKEND "cpu"
 #endif
@@ -94,6 +98,16 @@ int main(int argc, char** argv) {
     if (!opencl_fit_select_device(ctx, device, &err)) { fprintf(stderr, "opencl_fit_select_device failed: %s\n", err.c_str()); return 1; }
     opencl_fit_upload_light_curve(ctx, data);
     auto fit_cell = [&](double ln_s, double ln_q, const BinarySeedSet& seeds) { return opencl_fit_binary_seeds(ctx, data, ln_s, ln_q, seeds); };
+#elif defined(KAMPYLOS_CLI_METAL)
+    (void)device;
+    MetalFitContext ctx;
+    std::string err;
+    if (!metal_fit_select_device(ctx, &err)) { fprintf(stderr, "metal_fit_select_device failed: %s\n", err.c_str()); return 1; }
+    metal_fit_upload_light_curve(ctx, data);
+    auto fit_cell = [&](double ln_s, double ln_q, const BinarySeedSet& seeds) {
+        try { return metal_fit_binary_seeds(ctx, data, ln_s, ln_q, seeds); }
+        catch (const std::exception& e) { fprintf(stderr, "metal_fit_binary_seeds failed: %s\n", e.what()); exit(1); }
+    };
 #else
     (void)device;
     auto fit_cell = [&](double ln_s, double ln_q, const BinarySeedSet& seeds) { return fit_binary_seeds(vbm, data, ln_s, ln_q, seeds); };

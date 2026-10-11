@@ -28,9 +28,20 @@ void metal_fit_upload_light_curve(MetalFitContext& ctx, const std::vector<DataPo
 
 class VBMicrolensing;
 
+struct Candidate;
+
+// The objective itself: chi2 of each candidate (t0, u0, ln tE, alpha, ln rho) at LINEAR s, q,
+// exactly what the batched Nelder-Mead sees. Public so tests can compare it against the CPU
+// objective point by point (tests/test_metal_fit.mm).
+std::vector<double> metal_fit_eval_chi2(MetalFitContext& ctx, double s, double q, const std::vector<Candidate>& points);
+
+// Command buffers that failed at least once and were re-submitted (see kampylos_metal_fit.mm).
+long metal_fit_buffers_retried(const MetalFitContext& ctx);
+
 // Metal twin of gpu_fit_binary_seeds() (see gpu_fit_binary.h): runs every seed of a
 // kampylos_make_seeds() set at one grid cell, ln_s/ln_q natural logs; the work-unit driver
 // recomputes chi2/fs/fb exactly on the host afterwards.
+// Throws std::runtime_error if a command buffer keeps failing (the wrapper exits cleanly).
 // hooks/cell: optional in-cell checkpointing and progress (kampylos_batched_fit.h).
 BinaryFitResult metal_fit_binary_seeds(
     MetalFitContext& ctx,

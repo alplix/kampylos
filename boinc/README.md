@@ -29,6 +29,20 @@ GPU apps) so the version the app prints to stderr is the `version_num` the serve
 Run it in a directory with the two input files the app expects, `in` (one line, see `src/kampylos_wu.h`) and
 `photometry` (the event's light curve); it writes `out`. Outside a BOINC client it runs standalone.
 
+## Build (Metal, macOS)
+
+```
+VBM=vendor/VBMicrolensing/VBMicrolensing/lib
+clang++ -O2 -std=c++17 -fobjc-arc -I src -I $VBM -I <boinc>/api -I <boinc>/lib \
+    boinc/main_kampylos_metal_boinc.cpp src/kampylos_metal_fit.mm $VBM/VBMicrolensingLibrary.cpp \
+    <boinc>/api/libboinc_api.a <boinc>/lib/libboinc.a -framework Metal -framework Foundation -o kampylos_metal
+```
+
+`-fobjc-arc` is required: `kampylos_metal_fit.mm` relies on ARC to release Metal buffers it replaces. The kernel is
+compiled at start-up with fast math off and a self-test refuses to run if the compiler broke the double-single
+arithmetic; every command buffer is checked and re-submitted on failure (`src/kampylos_metal_fit.mm`). Validate a
+build with `tests/test_metal_fit.mm` and `src/fit_event.cpp -DKAMPYLOS_CLI_METAL` under `tests/regression/run_regression.py`.
+
 ## Checkpoints and resume
 
 Two files in the slot directory, both written atomically (temporary file + rename):
