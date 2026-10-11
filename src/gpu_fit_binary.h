@@ -20,6 +20,7 @@
 #include "kampylos_gpu_types.h"
 #include "binary_fit.h" // BinaryFitResult
 #include "lightcurve.h" // DataPoint
+#include "kampylos_batched_fit.h" // KampylosBatchedHooks
 
 struct GpuFitContext {
     LightCurvePoint* d_data = nullptr;
@@ -85,12 +86,15 @@ void gpu_upload_light_curve(GpuFitContext& ctx, const std::vector<DataPoint>& da
 // value -- the work-unit driver recomputes chi2/fs/fb exactly on the host
 // (kampylos_finalize_cell) so every backend reports the same numbers for the same parameters.
 // Requires gpu_upload_light_curve() to have been called for `data` first.
+// hooks/cell: optional in-cell checkpointing and progress (kampylos_batched_fit.h).
 BinaryFitResult gpu_fit_binary_seeds(
     GpuFitContext& ctx,
     const std::vector<DataPoint>& data,
     double ln_s, double ln_q,
     const BinarySeedSet& seeds,
-    int n_restarts = 2
+    int n_restarts = 2,
+    const KampylosBatchedHooks* hooks = nullptr,
+    int cell = 0
 );
 
 // Legacy entry point (unit tests): the 96-seed multistart around one anchor. Uploads `data`

@@ -183,12 +183,14 @@ BinaryFitResult opencl_fit_binary_seeds(
     const std::vector<DataPoint>& data,
     double ln_s, double ln_q,
     const BinarySeedSet& seeds,
-    int n_restarts
+    int n_restarts,
+    const KampylosBatchedHooks* hooks,
+    int cell
 ) {
     (void)data;
     double s = exp(ln_s), q = exp(ln_q);
     auto eval = [&](const std::vector<Candidate>& batch) { return opencl_eval_batch(ctx, s, q, batch); };
-    return kampylos_batched_fit_seeds(eval, ln_s, ln_q, seeds, n_restarts);
+    return kampylos_batched_fit_seeds(eval, ln_s, ln_q, seeds, n_restarts, hooks, cell, stderr);
 }
 
 BinaryFitResult opencl_fit_binary_multistart(

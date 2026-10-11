@@ -97,7 +97,12 @@ int main(int argc, char **argv) {
     if (kampylos_boinc_open_output(job, "opencl")) { boinc_finish(1); return 1; }
 
     VBMicrolensing vbm;
+    int cell = job.start_cell;   // cells are fitted in order, one call per cell
     return kampylos_boinc_run(job, vbm, [&](double ln_s, double ln_q, const BinarySeedSet &seeds) {
-        return opencl_fit_binary_seeds(opencl_ctx, job.data, ln_s, ln_q, seeds);
+        // in-cell checkpoint and progress, see kampylos_boinc_batched_hooks()
+        KampylosBatchedHooks hooks = kampylos_boinc_batched_hooks(cell, job.total);
+        BinaryFitResult r = opencl_fit_binary_seeds(opencl_ctx, job.data, ln_s, ln_q, seeds, 2, &hooks, cell);
+        cell++;
+        return r;
     });
 }
