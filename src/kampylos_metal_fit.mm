@@ -532,6 +532,8 @@ struct MetalFitImpl {
     int cand_capacity = 0;
     int local_size = 128;          // threads per threadgroup (power of two, <= the pipeline's maximum)
     long buffers_retried = 0;      // command buffers that failed at least once and were re-run
+    bool setup_transient = false;  // the last metal_fit_select_device() failure was "no usable GPU right
+                                   // now" (worth retrying later), not a compiler/pipeline problem
 };
 
 MetalFitContext::MetalFitContext() { impl = new MetalFitImpl(); }
@@ -542,8 +544,28 @@ MetalFitContext::~MetalFitContext() {
 
 bool metal_fit_select_device(MetalFitContext& ctx, std::string* err_out) {
     MetalFitImpl* m = (MetalFitImpl*)ctx.impl;
+    m->setup_transient = false;
     m->device = MTLCreateSystemDefaultDevice();
-    if (!m->device) { if (err_out) *err_out = "no Metal device found"; return false; }
+    if (!m->device) {
+        // 2026-10-12: MTLCreateSystemDefaultDevice() resolves the DISPLAY's GPU (Apple documents
+        // that it needs CoreGraphics linked), and from a process without a window-server session
+        // it can come back nil although the GPU is right there -- and a BOINC task is exactly
+        // that: started by the client daemon as the boinc_project user, possibly with nobody
+        // logged in. MTLCopyAllDevices() enumerates the GPUs without that dependency. Apple
+        // Silicon has one GPU, so the choice is unambiguous; an Intel Mac with two gets the
+        // non-low-power one, as the system default would pick.
+        NSArray<id<MTLDevice>>* all = MTLCopyAllDevices();
+        for (id<MTLDevice> d in all)
+            if (!m->device || (m->device.isLowPower && !d.isLowPower)) m->device = d;
+        if (m->device)
+            fprintf(stderr, "metal_fit_select_device: MTLCreateSystemDefaultDevice() returned nil; using \"%s\" from MTLCopyAllDevices() (%lu device(s))\n",
+                    [[m->device name] UTF8String], (unsigned long)all.count);
+    }
+    if (!m->device) {
+        m->setup_transient = true;
+        if (err_out) *err_out = "no Metal device found (MTLCreateSystemDefaultDevice and MTLCopyAllDevices both returned nothing)";
+        return false;
+    }
     fprintf(stderr, "metal_fit_select_device: using Metal device \"%s\"\n", [[m->device name] UTF8String]);
 
     m->queue = [m->device newCommandQueue];
@@ -599,7 +621,16 @@ bool metal_fit_select_device(MetalFitContext& ctx, std::string* err_out) {
     [cb commit];
     [cb waitUntilCompleted];
     const float* lo = (const float*)[self_buf contents];
-    if (cb.status != MTLCommandBufferStatusCompleted || lo[0] != 1.0f / 16777216.0f || lo[1] != 1.0f / 1073741824.0f) {
+    if (cb.status != MTLCommandBufferStatusCompleted) {
+        // The device would not even run a one-thread kernel: not a compiler problem but a GPU
+        // that is busy or lost right now (the same aborts metal_eval_batch retries), so the
+        // caller may try again later rather than give the work unit up.
+        m->setup_transient = true;
+        if (err_out) *err_out = std::string("self-test command buffer failed (status ") + std::to_string((long)cb.status) + "): " +
+                                (cb.error ? [[cb.error localizedDescription] UTF8String] : "no error object");
+        return false;
+    }
+    if (lo[0] != 1.0f / 16777216.0f || lo[1] != 1.0f / 1073741824.0f) {
         char buf[200];
         snprintf(buf, sizeof(buf), "double-single self-test failed (two_prod lo = %g, two_sum lo = %g): the Metal compiler applied fast math, results would be wrong", lo[0], lo[1]);
         if (err_out) *err_out = buf;
@@ -732,6 +763,10 @@ std::vector<double> metal_fit_eval_chi2(MetalFitContext& ctx, double s, double q
 
 long metal_fit_buffers_retried(const MetalFitContext& ctx) {
     return ((const MetalFitImpl*)ctx.impl)->buffers_retried;
+}
+
+bool metal_fit_setup_failure_is_transient(const MetalFitContext& ctx) {
+    return ((const MetalFitImpl*)ctx.impl)->setup_transient;
 }
 
 BinaryFitResult metal_fit_binary_seeds(

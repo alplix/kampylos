@@ -21,8 +21,15 @@ struct MetalFitContext {
 // No device index parameter -- same convention as metal_search.mm's own gpu_search_init():
 // MTLCreateSystemDefaultDevice() is the right call on every real Apple Silicon Mac (exactly one
 // GPU), and a discrete-GPU Intel Mac's default is still the right one to pick for a volunteer
-// host's main display GPU.
+// host's main display GPU. When it returns nil (no window-server session: the BOINC client
+// daemon's boinc_project user, nobody logged in) the device comes from MTLCopyAllDevices().
+// Compiles the kernel with fast math off and runs the double-single self-test.
 bool metal_fit_select_device(MetalFitContext& ctx, std::string* err_out);
+
+// After a failed metal_fit_select_device(): true if the failure was "no usable GPU right now"
+// (no device visible, or the device would not run the self-test kernel) rather than a compile
+// or pipeline error -- i.e. worth retrying later (boinc_temporary_exit) instead of failing.
+bool metal_fit_setup_failure_is_transient(const MetalFitContext& ctx);
 
 void metal_fit_upload_light_curve(MetalFitContext& ctx, const std::vector<DataPoint>& data);
 

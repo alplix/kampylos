@@ -26,6 +26,16 @@ int boinc_finish(int status) {
     exit(status);
 }
 
+// The real one writes the delay and reason to "boinc_temporary_exit" and exits 0; the client
+// then restarts the task after the delay. Here the file is written and the process exits 0.
+int boinc_temporary_exit(int delay, const char* reason, bool) {
+    fprintf(stderr, "boinc_stub: boinc_temporary_exit(%d, %s)\n", delay, reason ? reason : "");
+    FILE* fp = fopen("boinc_temporary_exit", "w");
+    if (fp) { fprintf(fp, "%d\n%s\n", delay, reason ? reason : ""); fclose(fp); }
+    fflush(stderr);
+    exit(0);
+}
+
 int boinc_resolve_filename(const char* virtual_name, char* physical_name, int len) {
     snprintf(physical_name, len, "%s", virtual_name);
     return 0;

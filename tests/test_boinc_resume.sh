@@ -27,7 +27,7 @@ if [ "$BACKEND" = metal ]; then
     $CXX -O2 -std=c++17 -fobjc-arc -I "$ROOT/src" -I "$VBM" -I "$ROOT/tests/boinc_stub" \
         "$ROOT/boinc/main_kampylos_metal_boinc.cpp" "$ROOT/src/kampylos_metal_fit.mm" \
         "$ROOT/tests/boinc_stub/boinc_stub.cpp" "$VBM/VBMicrolensingLibrary.cpp" \
-        -framework Metal -framework Foundation -o kampylos_stub 2>&1 | grep -v VBMicrolensingLibrary || true
+        -framework Metal -framework Foundation -framework CoreGraphics -o kampylos_stub 2>&1 | grep -v VBMicrolensingLibrary || true
 else
     $CXX -O2 -std=c++17 -I "$ROOT/src" -I "$VBM" -I "$ROOT/tests/boinc_stub" \
         "$ROOT/boinc/main_kampylos_boinc.cpp" "$ROOT/tests/boinc_stub/boinc_stub.cpp" "$VBM/VBMicrolensingLibrary.cpp" \

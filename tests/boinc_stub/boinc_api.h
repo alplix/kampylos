@@ -24,6 +24,7 @@ struct APP_INIT_DATA {
 inline void boinc_options_defaults(BOINC_OPTIONS& o) { o = BOINC_OPTIONS(); }
 int boinc_init_options(BOINC_OPTIONS*);
 int boinc_finish(int status);
+int boinc_temporary_exit(int delay, const char* reason = 0, bool is_notice = false);
 int boinc_resolve_filename(const char* virtual_name, char* physical_name, int len);
 int boinc_get_init_data(APP_INIT_DATA&);
 int boinc_fraction_done(double);
