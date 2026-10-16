@@ -77,3 +77,33 @@ which every function-local `static` is `thread_local` and `VBM_THREAD_SAFE` is d
 finite-source completion on several CPU threads (`src/kampylos_cpu_patch_pool.h`); with the unpatched upstream library the pool
 falls back to a single thread because upstream's statics are shared between threads. To build against plain upstream v5.6
 instead, run `python3 vendor/patch_vbm_thread_local.py` (it recognises the fork as already patched).
+
+## Faster CPU build (same results)
+
+Two build-level changes make the CPU app about 1.5-2x faster with a byte-identical result file. Neither touches the search
+code. Measured on an Apple M1 (macOS 15.7, Apple clang 14, `-O2`) with the synthetic planet work unit of the regression
+suite (`flux 0.2 0.2 1 -3 -3 1 log10`, one cell, 240 seeds): 1085 s with the build lines above, 536 s with both changes;
+the shipped `kampylos_v12_macos_arm64` took 832 s on the same input. The two result files from the two local builds are
+byte-identical (`cmp`), and so are the per-seed fits printed at `%.17g`.
+
+1. **Build VBMicrolensing without the `thread_local` patch.** The CPU app is single-threaded; the patch exists for the GPU
+   apps' completion threads. On macOS every access to one of the library's 577 `thread_local` variables is a call to
+   `_tlv_get_addr`, 46 % of the CPU app's samples with Apple clang 14 (18 % in the shipped binary, built with a newer
+   compiler); with emulated TLS (MinGW-w64 GCC, Android NDK below API 29) a thread_local costs more still. Plain statics
+   alone gave 1.35x.
+   ```
+   python3 vendor/patch_vbm_thread_local.py --strip      # fork -> plain upstream v5.6, VBM_THREAD_SAFE removed
+   # ... build the CPU app as above ...
+   git -C vendor/VBMicrolensing checkout -- .           # restore the fork before building a GPU app
+   ```
+   `--strip` also removes `VBM_THREAD_SAFE`, so a GPU app built from a stripped checkout by mistake runs its completion
+   step on one thread instead of corrupting the heap.
+2. **Link a faster allocator.** VBMicrolensing creates and deletes many small objects per magnification (`_theta`, `_point`,
+   `_curve`, image lists, far more inside the finite-source integration); about a third of the CPU app's time went to the
+   macOS system allocator. Measured with jemalloc (`libjemalloc.a` on the link line, no source change): 2.0x together with
+   step 1. mimalloc is the portable equivalent (Linux, Windows, macOS): `#include <mimalloc-new-delete.h>` in one
+   translation unit and link its library. The library allocates with `new`, so overriding `new`/`delete` covers the hot path.
+
+Check a new build before shipping it: build `src/fit_event.cpp` the old way and the new way, run the same work unit through
+both (e.g. the synthetic planet one above) and `cmp` the two result files. On one toolchain they must be byte-identical.
+Builds from different compilers can differ in the last printed digits, so compare like with like.

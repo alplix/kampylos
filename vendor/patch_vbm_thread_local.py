@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Make VBMicrolensing's function-local statics thread_local, in place.
+"""Make VBMicrolensing's function-local statics thread_local, in place -- or undo it.
 
 VBMicrolensingLibrary.cpp keeps its scratch state in function-local `static` variables (242 of
 them in v5.6, plus one in the header). A function-local static is shared by every call from every
@@ -13,8 +13,19 @@ for (the statics count must match), so an upstream update is noticed rather than
 It also adds `#define VBM_THREAD_LOCAL_STATICS 1` to the header, which kampylos_cpu_patch_pool.h
 uses to pick its default thread count (4 when patched, 1 otherwise).
 
+--strip is the reverse, for the CPU app (boinc/main_kampylos_boinc.cpp): it is single-threaded
+and does not need the patch, but pays for it on every access to one of the 577 thread_local
+variables -- on macOS each goes through a call to _tlv_get_addr (46 % of the CPU app's samples
+with Apple clang 14), with emulated TLS (MinGW-w64, Android below API 29) more. Plain statics
+make the CPU app about 1.35x faster with a byte-identical result file (see boinc/README.md).
+--strip also removes the VBM_THREAD_SAFE / VBM_THREAD_LOCAL_STATICS marker, so a GPU app built
+from the same checkout by mistake runs its completion step single-threaded instead of
+corrupting the heap. The result is plain upstream v5.6 again; restore the fork's files with
+`git -C vendor/VBMicrolensing checkout -- .` before building a GPU app.
+
 Usage (from the repo root, after `git submodule update --init`):
     python3 vendor/patch_vbm_thread_local.py            # patch
+    python3 vendor/patch_vbm_thread_local.py --strip    # undo (CPU app build)
     python3 vendor/patch_vbm_thread_local.py --check    # exit 0 if patched, 1 if not
 """
 import re
@@ -34,10 +45,16 @@ EXPECTED_HDR = 1     # `static double dx1, dx2;` inside _point::operator-
 # they are, so only the one known function-local declaration is touched.
 CPP_STATIC = re.compile(r"^([ \t]+)static([ \t])", re.M)
 HDR_STATIC = re.compile(r"^([ \t]+)static([ \t]+double dx1, dx2;)", re.M)
+CPP_TLS = re.compile(r"^([ \t]+)thread_local static([ \t])", re.M)
+HDR_TLS = re.compile(r"^([ \t]+)thread_local static([ \t]+double dx1, dx2;)", re.M)
+# The markers to drop with --strip: ours, and the alplix/VBMicrolensing fork's define together
+# with the comment lines it carries ("// bitboinc patch: ..."). Line endings may be CRLF.
+MARKER_LINES = re.compile(r"^(?://[^\n]*bitboinc patch[^\n]*\r?\n(?://[^\n]*\r?\n)*)?#define VBM_THREAD_(?:SAFE|LOCAL_STATICS) 1[ \t]*\r?\n", re.M)
 
 
 def main():
     check_only = "--check" in sys.argv
+    strip = "--strip" in sys.argv
     if not os.path.isfile(CPP) or not os.path.isfile(HDR):
         print("VBMicrolensing sources not found under %s (run: git submodule update --init)" % LIB)
         return 2
@@ -48,6 +65,23 @@ def main():
     if check_only:
         print("patched" if patched else "NOT patched")
         return 0 if patched else 1
+    if strip:
+        if not patched and "thread_local static" not in cpp:
+            print("already plain (no thread_local statics)")
+            return 0
+        n_cpp = len(CPP_TLS.findall(cpp))
+        n_hdr = len(HDR_TLS.findall(hdr))
+        if n_cpp != EXPECTED_CPP or n_hdr != EXPECTED_HDR:
+            print("unexpected library version: found %d/%d thread_local statics in .cpp/.h, expected %d/%d -- not stripping"
+                  % (n_cpp, n_hdr, EXPECTED_CPP, EXPECTED_HDR))
+            return 1
+        cpp2 = CPP_TLS.sub(r"\1static\2", cpp)
+        hdr2 = MARKER_LINES.sub("", HDR_TLS.sub(r"\1static\2", hdr))
+        open(CPP, "w").write(cpp2)
+        open(HDR, "w").write(hdr2)
+        print("stripped %d thread_local statics in %s and %d in %s (marker removed)"
+              % (n_cpp, os.path.relpath(CPP), n_hdr, os.path.relpath(HDR)))
+        return 0
     if patched:
         print("already patched")
         return 0
