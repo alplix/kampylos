@@ -82,8 +82,8 @@ instead, run `python3 vendor/patch_vbm_thread_local.py` (it recognises the fork 
 
 Two build-level changes make the CPU app about 1.5-2x faster with a byte-identical result file. Neither touches the search
 code. Measured on an Apple M1 (macOS 15.7, Apple clang 14, `-O2`) with the synthetic planet work unit of the regression
-suite (`flux 0.2 0.2 1 -3 -3 1 log10`, one cell, 240 seeds): 1085 s with the build lines above, 536 s with both changes;
-the shipped `kampylos_v12_macos_arm64` took 832 s on the same input. The two result files from the two local builds are
+suite (`flux 0.2 0.2 1 -3 -3 1 log10`, one cell, 240 seeds): 1066 s with the build lines above, 536 s with both changes;
+the shipped `kampylos_v12_macos_arm64` took 839 s on the same input. The two result files from the two local builds are
 byte-identical (`cmp`), and so are the per-seed fits printed at `%.17g`.
 
 1. **Build VBMicrolensing without the `thread_local` patch.** The CPU app is single-threaded; the patch exists for the GPU
