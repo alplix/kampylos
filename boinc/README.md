@@ -40,13 +40,21 @@ Run it in a directory with the two input files the app expects, `in` (one line, 
 VBM=vendor/VBMicrolensing/VBMicrolensing/lib
 clang++ -O2 -std=c++17 -fobjc-arc -I src -I $VBM -I <boinc>/api -I <boinc>/lib \
     boinc/main_kampylos_metal_boinc.cpp src/kampylos_metal_fit.mm $VBM/VBMicrolensingLibrary.cpp \
-    <boinc>/api/libboinc_api.a <boinc>/lib/libboinc.a -framework Metal -framework Foundation -o kampylos_metal
+    <boinc>/api/libboinc_api.a <boinc>/lib/libboinc.a \
+    -framework Metal -framework Foundation -framework CoreGraphics -o kampylos_metal
 ```
 
 `-fobjc-arc` is required: `kampylos_metal_fit.mm` relies on ARC to release Metal buffers it replaces. The kernel is
 compiled at start-up with fast math off and a self-test refuses to run if the compiler broke the double-single
 arithmetic; every command buffer is checked and re-submitted on failure (`src/kampylos_metal_fit.mm`). Validate a
 build with `tests/test_metal_fit.mm` and `src/fit_event.cpp -DKAMPYLOS_CLI_METAL` under `tests/regression/run_regression.py`.
+
+Metal device access: `MTLCreateSystemDefaultDevice()` resolves the display's GPU and, per Apple, needs CoreGraphics
+linked (hence the framework above); from a process with no window-server session -- a BOINC task runs as
+`boinc_project` under the client daemon, possibly with nobody logged in -- it can return nil although the GPU is there.
+The app then takes the device from `MTLCopyAllDevices()`. If there is still no device, or the device will not run the
+self-test, or command buffers keep being aborted (another process hogging the GPU), the app calls
+`boinc_temporary_exit()` instead of failing: the task and its checkpoints stay, and the client retries after 300 s.
 
 ## Checkpoints and resume
 

@@ -6,7 +6,14 @@
 // No "--device N" parsing (unlike the CUDA/OpenCL wrappers): MTLCreateSystemDefaultDevice() is
 // the right call on every real Mac this would run on (exactly one GPU on Apple Silicon; the
 // right default on a discrete-GPU Intel Mac too) -- same convention as metal_search.mm's own
-// gpu_search_init() for Potamos/Keraunos's Metal builds.
+// gpu_search_init() for Potamos/Keraunos's Metal builds -- with MTLCopyAllDevices() as the
+// fallback for a session without a window server (see metal_fit_select_device).
+//
+// A GPU that is unavailable right now (no device visible, or command buffers that keep being
+// aborted because another process hogs the GPU) is NOT a reason to fail the work unit: those
+// paths end in boinc_temporary_exit(), which leaves the task and its checkpoints intact and has
+// the client start it again after a delay (it gives up only after 100 such exits with no
+// checkpoint in between). Build and input problems still end in boinc_finish(1).
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -24,6 +31,10 @@
 #ifndef KAMPYLOS_METAL_VERSION
 #define KAMPYLOS_METAL_VERSION "2"
 #endif
+
+// Seconds the client waits before restarting the task after a boinc_temporary_exit() (BOINC's
+// own default when an app gives none is 300).
+#define KAMPYLOS_METAL_RETRY_DELAY_S 300
 
 int main(int argc, char **argv) {
     (void)argc; (void)argv;
@@ -57,6 +68,10 @@ int main(int argc, char **argv) {
     std::string metal_err;
     if (!metal_fit_select_device(metal_ctx, &metal_err)) {
         fprintf(stderr, "metal_fit_select_device failed: %s\n", metal_err.c_str());
+        if (metal_fit_setup_failure_is_transient(metal_ctx)) {
+            fprintf(stderr, "no usable Metal device at the moment -- temporary exit, the client will retry in %d s\n", KAMPYLOS_METAL_RETRY_DELAY_S);
+            boinc_temporary_exit(KAMPYLOS_METAL_RETRY_DELAY_S, "Metal device unavailable, will retry", false);
+        }
         boinc_finish(1);
         return 1;
     }
@@ -74,12 +89,14 @@ int main(int argc, char **argv) {
             cell++;
             return r;
         } catch (const std::exception &e) {
-            // A command buffer kept failing even after re-submission (another process may be
-            // monopolising the GPU, or the device was lost): stop with the reason in stderr
-            // rather than write a cell computed from stale results. The client restarts the
-            // task from its last checkpoint.
-            fprintf(stderr, "metal_fit_binary_seeds failed: %s\n", e.what());
-            boinc_finish(1);
+            // A command buffer kept failing even after re-submission (another process is
+            // monopolising the GPU, or the device was lost): stop rather than write a cell
+            // computed from stale results -- as a temporary exit, not an error: the finished
+            // cells are in "out", the in-cell checkpoint is on disk, and the client restarts the
+            // task from them after the delay. (Until 2026-10-12 this was boinc_finish(1), which
+            // reported the work unit as failed and threw its progress away.)
+            fprintf(stderr, "metal_fit_binary_seeds failed: %s -- temporary exit, the client will retry in %d s\n", e.what(), KAMPYLOS_METAL_RETRY_DELAY_S);
+            boinc_temporary_exit(KAMPYLOS_METAL_RETRY_DELAY_S, "Metal command buffers keep failing, will retry", false);
             return BinaryFitResult{};
         }
     });
