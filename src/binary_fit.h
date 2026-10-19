@@ -179,6 +179,18 @@ struct BinarySeedSet {
     size_t size() const { return x0.size(); }
 };
 
+// The seeds of part `part` of `nparts` (k % nparts == part, interleaved so the parts cost about
+// the same): what a seed-split work unit ("part i K" on the input line, see kampylos_wu.h) asks
+// one task to fit; the server merges the parts by keeping the lowest chi2 per cell. The CPU app
+// applies the same rule seed by seed (kampylos_cpu_cell.h); the GPU wrappers take this subset
+// and run their batched driver on it (2026-10-19). nparts <= 1 returns the whole set.
+inline BinarySeedSet kampylos_seed_part(const BinarySeedSet& all, int part, int nparts) {
+    if (nparts <= 1) return all;
+    BinarySeedSet own;
+    for (size_t k = (size_t)part; k < all.size(); k += (size_t)nparts) own.add(all.x0[k], all.step[k]);
+    return own;
+}
+
 struct BinarySeedAnchors {
     // (A) optimized single-lens anchor (best of PSPL/FSPL/FSPL+LD)
     double t0, u0, tE, rho;

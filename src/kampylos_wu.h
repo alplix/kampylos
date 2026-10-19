@@ -19,8 +19,8 @@
 // the parts cost about the same). Each part writes the normal one-line-per-cell result (best of ITS
 // seeds); the result files of the K parts are merged by keeping the lowest chi2 per cell, which is
 // exactly what kampylos_analyze.py's dedupe_cells() already did for re-issued work units. Absent =
-// part 0 of 1 = all seeds, the historical behaviour. Backends that cannot split (GPU) must reject
-// nparts > 1.
+// part 0 of 1 = all seeds, the historical behaviour. Since 2026-10-19 the GPU wrappers split too
+// (kampylos_seed_part() in binary_fit.h); GPU binaries from before that reject nparts > 1.
 // NOTE: binaries built before this change read the line with a fixed 7-field fscanf and
 // IGNORE the marker, i.e. they would run a log10 WU with ln semantics. Their result header is
 // the old one ("# log_s log_q chi2 ..."), which kampylos_validate.sh rejects for a log10 WU,

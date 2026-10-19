@@ -123,8 +123,9 @@ struct KampylosBoincJob {
 
 // Resolves/parses "in" and loads "photometry". Returns 0 on success; on failure prints the
 // reason and returns non-zero (the caller does boinc_finish(1)).
-// allow_parts: only the CPU app can fit a part of each cell's seeds (input token "part i K", v12); the batched GPU
-// backends refuse such a work unit instead of silently computing every seed.
+// allow_parts: the app fits a part of each cell's seeds when the input line says so ("part i K", CPU app v12;
+// the GPU wrappers since 2026-10-19 via kampylos_seed_part()). A wrapper that cannot split passes false and
+// refuses such a work unit instead of silently computing every seed.
 static int kampylos_boinc_load_inputs(KampylosBoincJob &job, bool allow_parts = false) {
     char phot_path[512], in_path[512];
     if (boinc_resolve_filename("photometry", phot_path, sizeof(phot_path))) {
@@ -151,6 +152,7 @@ static int kampylos_boinc_load_inputs(KampylosBoincJob &job, bool allow_parts = 
         fprintf(stderr, "this backend cannot run a seed-split work unit (part %d of %d)\n", job.in.part, job.in.nparts);
         return 1;
     }
+    if (job.in.nparts > 1) fprintf(stderr, "seed-split work unit: part %d of %d (seeds %d, %d, %d, ... of each cell)\n", job.in.part, job.in.nparts, job.in.part, job.in.part + job.in.nparts, job.in.part + 2 * job.in.nparts);
     try {
         job.data = load_photometry(phot_path, job.in.is_mag);
     } catch (const std::exception &e) {

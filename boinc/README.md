@@ -5,10 +5,16 @@ work-unit files, progress, checkpointing and result upload.
 
 | file | backend |
 |---|---|
-| `main_kampylos_boinc.cpp` | CPU (all platforms); supports seed-split work units (`part i K` in the input line) |
+| `main_kampylos_boinc.cpp` | CPU (all platforms) |
 | `main_kampylos_gpu_boinc.cpp` | CUDA |
 | `main_kampylos_opencl_boinc.cpp` | OpenCL |
 | `main_kampylos_metal_boinc.cpp` | Apple Metal |
+
+All four accept seed-split work units (`part i K` at the end of the input line: this task fits every K-th seed of each
+cell starting at seed i, the server keeps the lowest chi2 per cell over the K parts). The CPU app has since v12; the GPU
+wrappers since 2026-10-19 (`kampylos_seed_part()` in `src/binary_fit.h`) -- GPU binaries built before that refuse such a
+work unit. Splitting is how a cell that needs the finite-source integration for most of its points (single-lens anchor
+with `n_peak` close to `npts`) is cut into tasks of a few hours instead of days, on GPU hosts as on CPU hosts.
 | `kampylos_boinc_common.h` | shared input/output/checkpoint handling |
 
 ## Build (CPU, Linux example)

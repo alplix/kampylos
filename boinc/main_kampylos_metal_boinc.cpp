@@ -58,7 +58,7 @@ int main(int argc, char **argv) {
     // every input file before touching the GPU at all, so a bad invocation fails before any
     // Metal device/pipeline gets created on this or any machine.
     KampylosBoincJob job;
-    if (kampylos_boinc_load_inputs(job)) { boinc_finish(1); return 1; }
+    if (kampylos_boinc_load_inputs(job, true)) { boinc_finish(1); return 1; }   // seed-split WUs too, see below
     kampylos_boinc_compute_anchor(job);
 
     // Metal setup, now that every input has validated -- device/pipeline creation is the first
@@ -82,10 +82,12 @@ int main(int argc, char **argv) {
     VBMicrolensing vbm;
     int cell = job.start_cell;   // cells are fitted in order, one call per cell
     return kampylos_boinc_run(job, vbm, [&](double ln_s, double ln_q, const BinarySeedSet &seeds) {
-        // in-cell checkpoint and progress, see kampylos_boinc_batched_hooks()
+        // in-cell checkpoint and progress, see kampylos_boinc_batched_hooks(); a seed-split work
+        // unit ("part i K") gets this part's seeds only, as in the CPU app (kampylos_seed_part)
         KampylosBatchedHooks hooks = kampylos_boinc_batched_hooks(cell, job.total);
+        BinarySeedSet own = kampylos_seed_part(seeds, job.in.part, job.in.nparts);
         try {
-            BinaryFitResult r = metal_fit_binary_seeds(metal_ctx, job.data, ln_s, ln_q, seeds, 2, &hooks, cell);
+            BinaryFitResult r = metal_fit_binary_seeds(metal_ctx, job.data, ln_s, ln_q, own, 2, &hooks, cell);
             cell++;
             return r;
         } catch (const std::exception &e) {
