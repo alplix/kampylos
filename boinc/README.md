@@ -56,6 +56,18 @@ The app then takes the device from `MTLCopyAllDevices()`. If there is still no d
 self-test, or command buffers keep being aborted (another process hogging the GPU), the app calls
 `boinc_temporary_exit()` instead of failing: the task and its checkpoints stay, and the client retries after 300 s.
 
+## CPU threads of the GPU apps
+
+The GPU apps finish every candidate on the CPU (`src/kampylos_cpu_patch_pool.h`: the points the kernel's point-source
+test rejects go through VBMicrolensing's finite-source integration). Since 2026-10-19 that pool has as many threads as the
+client budgeted for the task -- `init_data`'s `ncpus`, i.e. the app version's `avg_ncpus` from the plan class -- rounded
+down and at least one, and the app prints the count (`completion step: N CPU thread(s) (client budget ...)`). The plan
+classes currently declare 0.1-0.25 CPUs, so a task runs one completion thread; before this the pool always took four
+cores, which the client had meanwhile given to other tasks. To let the completion step use more cores, raise `avg_ncpus`
+in the plan class (`plan_class_spec.xml`, or the `--avg_ncpus` of the app version); the app follows. Outside BOINC
+(`fit_event`, tests) the pool keeps the compile-time default, `KAMPYLOS_PATCH_THREADS` (4 with the thread-safe
+VBMicrolensing fork, 1 otherwise). The stub takes the budget from `KAMPYLOS_STUB_NCPUS`.
+
 ## Checkpoints and resume
 
 Two files in the slot directory, both written atomically (temporary file + rename):

@@ -24,6 +24,7 @@
 // before boinc_api.h/filesys.h.
 #include "../src/kampylos_wu.h"
 #include "../src/kampylos_metal_fit.h"
+#include "../src/kampylos_cpu_patch_pool.h"   // kampylos_set_patch_threads()
 
 #include "kampylos_boinc_common.h"
 
@@ -52,6 +53,15 @@ int main(int argc, char **argv) {
     if (rc) {
         fprintf(stderr, "boinc_init_options failed: %d\n", rc);
         return rc;
+    }
+
+    // The completion step's CPU threads (src/kampylos_cpu_patch_pool.h) follow the client's CPU
+    // budget for this task, see kampylos_boinc_cpu_threads(). Until 2026-10-19 the pool took
+    // four cores whatever the metal_apple_gpu plan class declared (0.1).
+    APP_INIT_DATA aid;
+    if (boinc_get_init_data(aid) == 0) {
+        int n = kampylos_set_patch_threads(kampylos_boinc_cpu_threads(aid));
+        fprintf(stderr, "completion step: %d CPU thread(s) (client budget %.2f CPUs)\n", n, aid.ncpus);
     }
 
     // Same ordering discipline as the other GPU wrappers in this project: parse and validate

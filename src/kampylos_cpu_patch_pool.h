@@ -72,17 +72,42 @@
 // defines VBM_THREAD_LOCAL_STATICS in the library header, so an unpatched checkout (the plain
 // upstream submodule) automatically runs the completion step single-threaded instead of
 // corrupting the heap within the first batch. Override with -DKAMPYLOS_PATCH_THREADS=N.
-#ifndef KAMPYLOS_PATCH_THREADS
 #if defined(VBM_THREAD_LOCAL_STATICS) || defined(VBM_THREAD_SAFE)   // patch script / the alplix fork
+#define KAMPYLOS_VBM_THREAD_SAFE 1
+#else
+#define KAMPYLOS_VBM_THREAD_SAFE 0
+#endif
+#ifndef KAMPYLOS_PATCH_THREADS
+#if KAMPYLOS_VBM_THREAD_SAFE
 #define KAMPYLOS_PATCH_THREADS 4
 #else
 #define KAMPYLOS_PATCH_THREADS 1
 #endif
 #endif
 
+// Worker count of the pool each GPU backend creates on its first batch (process-wide, like the
+// pool itself). Defaults to KAMPYLOS_PATCH_THREADS; the BOINC wrappers set it before the first
+// cell from the client's CPU budget for the task (kampylos_boinc_cpu_threads() in
+// boinc/kampylos_boinc_common.h), so a task the server declares as 0.1 CPUs runs its completion
+// step on one thread and one declared as 4 CPUs on four. Until 2026-10-19 the pool always took
+// KAMPYLOS_PATCH_THREADS (4) cores while the GPU plan classes promised 0.1-0.25: the client
+// scheduled CPU tasks on the cores it believed free, and a Metal task was seen at 350 % CPU.
+// Clamped to [1, hardware threads], and to 1 unless the vendored VBMicrolensing is thread-safe.
+// Has no effect on a pool that already exists.
+inline int& kampylos_patch_threads_setting() { static int n = KAMPYLOS_PATCH_THREADS; return n; }
+inline int kampylos_patch_threads() { return kampylos_patch_threads_setting(); }
+inline int kampylos_set_patch_threads(int n) {
+    int hw = (int)std::thread::hardware_concurrency();
+    if (hw >= 1) n = std::min(n, hw);
+    if (!KAMPYLOS_VBM_THREAD_SAFE) n = 1;
+    n = std::max(1, n);
+    kampylos_patch_threads_setting() = n;
+    return n;
+}
+
 class KampylosCpuPatchPool {
 public:
-    explicit KampylosCpuPatchPool(int n_threads = KAMPYLOS_PATCH_THREADS)
+    explicit KampylosCpuPatchPool(int n_threads = kampylos_patch_threads())
         : vbms_(std::max(1, n_threads)) {
         for (int t = 1; t < (int)vbms_.size(); t++) workers_.emplace_back([this, t]() { worker_loop(t); });
     }

@@ -2,7 +2,9 @@
 // Files are plain files in the working directory. boinc_time_to_checkpoint() follows the real
 // API's contract (true at most once per period, then re-armed by boinc_checkpoint_completed());
 // the period comes from KAMPYLOS_STUB_CHECKPOINT_SECONDS (default 60, 0 = every call), so a
-// resume test can make the app checkpoint after every seed.
+// resume test can make the app checkpoint after every seed. KAMPYLOS_STUB_NCPUS (default 1)
+// is the CPU budget boinc_get_init_data() reports, e.g. 0.1 to run a GPU wrapper the way the
+// client runs it under the metal_apple_gpu plan class.
 #include "boinc_api.h"
 #include "filesys.h"
 #include <cstdio>
@@ -41,7 +43,11 @@ int boinc_resolve_filename(const char* virtual_name, char* physical_name, int le
     return 0;
 }
 
-int boinc_get_init_data(APP_INIT_DATA& d) { d = APP_INIT_DATA(); return 0; }
+int boinc_get_init_data(APP_INIT_DATA& d) {
+    d = APP_INIT_DATA();
+    if (const char* p = getenv("KAMPYLOS_STUB_NCPUS")) d.ncpus = atof(p);
+    return 0;
+}
 
 int boinc_fraction_done(double f) {
     FILE* fp = fopen("stub_fraction_done", "w");

@@ -22,6 +22,7 @@
 // macro pollution colliding with VBMicrolensingLibrary.h's local variable names.
 #include "../src/kampylos_wu.h"
 #include "../src/gpu_fit_binary.h"
+#include "../src/kampylos_cpu_patch_pool.h"   // kampylos_set_patch_threads()
 
 #include "kampylos_boinc_common.h"
 
@@ -64,8 +65,17 @@ int main(int argc, char **argv) {
     // physical device because BOINC's own client marks --device deprecated in favor of
     // app_init_data). --device remains as a fallback for standalone testing outside BOINC.
     APP_INIT_DATA aid;
-    if (!boinc_get_init_data(aid) && aid.gpu_device_num >= 0) {
+    bool have_aid = boinc_get_init_data(aid) == 0;
+    if (have_aid && aid.gpu_device_num >= 0) {
         device_id = aid.gpu_device_num;
+    }
+
+    // The completion step's CPU threads (src/kampylos_cpu_patch_pool.h) follow the client's CPU
+    // budget for this task, see kampylos_boinc_cpu_threads(). Until 2026-10-19 the pool took
+    // four cores whatever the plan class declared.
+    if (have_aid) {
+        int n = kampylos_set_patch_threads(kampylos_boinc_cpu_threads(aid));
+        fprintf(stderr, "completion step: %d CPU thread(s) (client budget %.2f CPUs)\n", n, aid.ncpus);
     }
 
     // Same ordering discipline as the other GPU wrappers in this project: parse and validate

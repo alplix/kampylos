@@ -19,6 +19,7 @@
 // colliding with VBMicrolensingLibrary.h's local variable names.
 #include "../src/kampylos_wu.h"
 #include "../src/kampylos_opencl_fit.h"
+#include "../src/kampylos_cpu_patch_pool.h"   // kampylos_set_patch_threads()
 
 #include "kampylos_boinc_common.h"
 
@@ -68,10 +69,19 @@ int main(int argc, char **argv) {
     // intended. Overrides device_id with the correct index when init_data has one;
     // --device remains as a fallback for standalone testing outside BOINC.
     APP_INIT_DATA aid;
-    if (!boinc_get_init_data(aid) && aid.gpu_opencl_dev_index >= 0) {
+    bool have_aid = boinc_get_init_data(aid) == 0;
+    if (have_aid && aid.gpu_opencl_dev_index >= 0) {
         fprintf(stderr, "main_kampylos_opencl: overriding device index %d -> %d from app_init_data (gpu_opencl_dev_index)\n",
                 device_id, aid.gpu_opencl_dev_index);
         device_id = aid.gpu_opencl_dev_index;
+    }
+
+    // The completion step's CPU threads (src/kampylos_cpu_patch_pool.h) follow the client's CPU
+    // budget for this task, see kampylos_boinc_cpu_threads(). Until 2026-10-19 the pool took
+    // four cores whatever the plan class declared.
+    if (have_aid) {
+        int n = kampylos_set_patch_threads(kampylos_boinc_cpu_threads(aid));
+        fprintf(stderr, "completion step: %d CPU thread(s) (client budget %.2f CPUs)\n", n, aid.ncpus);
     }
 
     // Same ordering discipline as the other GPU wrappers in this project: parse and validate

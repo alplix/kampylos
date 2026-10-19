@@ -194,7 +194,8 @@ static std::vector<double> opencl_eval_batch(
     // kampylos_cpu_patch_pool.h for the full story) -- this loop was the same single-threaded
     // bottleneck for a pathological anchor, now spread across a small worker-thread pool instead.
     // Created once, never destroyed: see kampylos_cpu_patch_pool.h (persistent workers; the
-    // thread count depends on whether the vendored VBMicrolensing is thread-safe).
+    // thread count is kampylos_patch_threads(): the BOINC wrapper's CPU budget, and 1 unless the
+    // vendored VBMicrolensing is thread-safe).
     static KampylosCpuPatchPool& patch_pool = *new KampylosCpuPatchPool();
     patch_pool.complete_batch(h_res, points, ctx.h_data.data(), s, q, chi2, ctx.fs_bound, ctx.flux_offset);
     return chi2;

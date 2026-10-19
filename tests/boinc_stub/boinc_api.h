@@ -19,6 +19,7 @@ struct APP_INIT_DATA {
     int gpu_device_num = -1;
     int gpu_opencl_dev_index = -1;
     double checkpoint_period = 60;
+    double ncpus = 1;   // the client's CPU budget for the task (app version avg_ncpus)
 };
 
 inline void boinc_options_defaults(BOINC_OPTIONS& o) { o = BOINC_OPTIONS(); }

@@ -1,0 +1,194 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Kampylos report 2026-10-16</title>
+<style>
+  :root { --bg:#fff; --fg:#1b1b1b; --muted:#5d5d5d; --line:#d9d9d9; --code:#f4f4f4; --ok:#1d7a3a; --warn:#b26a00; --bad:#b3261e; --accent:#2457a3; }
+  @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) { --bg:#141414; --fg:#e6e6e6; --muted:#a3a3a3; --line:#333; --code:#1f1f1f; --ok:#5fd38a; --warn:#f0b35a; --bad:#ff7b72; --accent:#7fb0ff; } }
+  :root[data-theme="dark"] { --bg:#141414; --fg:#e6e6e6; --muted:#a3a3a3; --line:#333; --code:#1f1f1f; --ok:#5fd38a; --warn:#f0b35a; --bad:#ff7b72; --accent:#7fb0ff; }
+  body { margin:0; padding:24px 16px 64px; background:var(--bg); color:var(--fg); font:15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
+  main { max-width: 980px; margin: 0 auto; }
+  h1 { font-size: 26px; margin: 0 0 4px; } h2 { font-size: 20px; margin: 36px 0 8px; border-bottom: 1px solid var(--line); padding-bottom: 4px; } h3 { font-size: 16px; margin: 22px 0 6px; }
+  .sub { color: var(--muted); margin-bottom: 20px; }
+  .scroll { overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; margin: 10px 0 16px; font-size: 14px; }
+  th, td { border: 1px solid var(--line); padding: 6px 8px; text-align: left; vertical-align: top; }
+  td.n, th.n { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  th { background: var(--code); }
+  code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 13px; }
+  code { background: var(--code); padding: 1px 4px; border-radius: 3px; overflow-wrap: anywhere; }
+  pre { background: var(--code); padding: 10px 12px; border-radius: 6px; overflow-x: auto; }
+  .ok { color: var(--ok); font-weight: 600; } .warn { color: var(--warn); font-weight: 600; } .bad { color: var(--bad); font-weight: 600; }
+  .box { border: 1px solid var(--line); border-left: 4px solid var(--accent); padding: 8px 12px; margin: 12px 0; border-radius: 4px; }
+  a { color: var(--accent); }
+  ul, ol { padding-left: 22px; }
+</style>
+</head>
+<body>
+<main>
+<h1>Kampylos: a 1.5&ndash;2&times; faster CPU app with identical results, and what the shipped binaries are missing</h1>
+<div class="sub">Against <code>alplix/kampylos</code> master <code>12cb505</code> (submodule <code>alplix/VBMicrolensing@a56b7bf</code>), 2026-10-16. All measurements were taken on a bitboinc
+volunteer host: Apple M1, macOS 15.7.4, BOINC client 8.2.10, Apple clang 14. Follow-up to the reviews of 2026-10-10 and 2026-10-12.</div>
+
+<h2>1. Summary</h2>
+<ol>
+  <li><b>The CPU app can be about 2&times; faster with a byte-identical result file, without touching the search code.</b> Build VBMicrolensing without the <code>thread_local</code> patch (the CPU app is
+      single-threaded and does not need it) and link a faster allocator. One synthetic work unit: 1066&nbsp;s with the build lines in <code>boinc/README.md</code>, 536&nbsp;s with both changes (1.99&times;); the
+      <code>kampylos_v12_macos_arm64</code> binary the server ships takes 839&nbsp;s on the same input (1.57&times;; newer compiler, same two overheads). Branch <code>build/faster-cpu-app</code> on
+      <code>rilian/kampylos</code> adds a <code>--strip</code> mode to <code>vendor/patch_vbm_thread_local.py</code> and documents the build. Details and evidence in §2.</li>
+  <li><b>The macOS binaries the server ships do not contain the fixes merged on 2026-10-11.</b> <code>kampylos_v12_macos_arm64</code> still restarts from cell 0 when the checkpoint and the output disagree,
+      and <code>kampylos_metal_v2_macos_arm64</code> has no in-cell checkpoint, leaves fast math on and never checks a command buffer. Rebuilding both from <code>12cb505</code> and releasing them as new
+      versions is all that is needed. §3.</li>
+  <li><b>Two open items</b>: a Metal task that gets no device from <code>MTLCreateSystemDefaultDevice()</code> still fails the work unit (branch <code>fix/metal-device-unavailable</code>), and the
+      <code>rsc_fpops_est</code> of some work units is 20&ndash;50&times; too low (an event whose tasks take 4&ndash;8 CPU-days each is estimated at 4 hours). §4.</li>
+</ol>
+
+<h2>2. CPU app: the same answer in half the time</h2>
+<h3>2.1 Where the time goes</h3>
+<p>Sampled with macOS <code>sample</code> while fitting one grid cell (main thread only):</p>
+<div class="scroll"><table>
+<tr><th>binary and input</th><th class="n">thread-local lookups (<code>_tlv_get_addr</code>)</th><th class="n">malloc / free</th><th class="n">everything else</th></tr>
+<tr><td>shipped <code>kampylos_v12_macos_arm64</code>, synthetic planet WU</td><td class="n">18&nbsp;%</td><td class="n">36&nbsp;%</td><td class="n">46&nbsp;%</td></tr>
+<tr><td>shipped <code>kampylos_v12_macos_arm64</code>, a real event (ev25055)</td><td class="n">15&nbsp;%</td><td class="n">31&nbsp;%</td><td class="n">54&nbsp;%</td></tr>
+<tr><td>master built with Apple clang 14 <code>-O2</code> as in <code>boinc/README.md</code>, ev25055</td><td class="n">46&nbsp;%</td><td class="n">23&nbsp;%</td><td class="n">31&nbsp;%</td></tr>
+</table></div>
+<p>Both overheads are in VBMicrolensing, not in Kampylos (Nelder-Mead, the flux fit and the seeding together are under 0.2&nbsp;% of the samples):</p>
+<ul>
+  <li><b>Thread-local storage.</b> The fork turns the library's 242 function-local <code>static</code> declarations (577 variables) into <code>thread_local</code> so that the GPU apps' four completion threads
+      can share it. Apart from that keyword and the <code>VBM_THREAD_SAFE</code> define, the fork is byte-for-byte upstream v5.6 (<code>diff</code> of <code>e7c7404</code> against <code>a56b7bf</code>, ignoring line endings).
+      On macOS every access to a <code>thread_local</code> is a call into <code>libdyld</code>; the CPU app is single-threaded and gets nothing for it.</li>
+  <li><b>Allocation.</b> Every magnification creates and deletes many small objects (<code>_theta</code>, <code>_point</code>, <code>_curve</code>, <code>_skiplist_curve</code>, image lists), and the finite-source
+      contour integration creates far more. The macOS system allocator spends about a third of the run in <code>tiny_malloc</code> / <code>free_tiny</code>.</li>
+</ul>
+
+<h3>2.2 Measured</h3>
+<p>Every variant below is master <code>12cb505</code> built with Apple clang 14 <code>-O2</code>, and each prints all ten fitted doubles of every seed at <code>%.17g</code>. Two workloads, both real code paths
+(<code>kampylos_make_seeds</code> + <code>fit_binary_local_steps</code> with the app's defaults):</p>
+<ul>
+  <li><b>A</b>: <code>tests/regression/synthetic_planet.dat</code> (401 points), cell log10&nbsp;s&nbsp;=&nbsp;0.2, log10&nbsp;q&nbsp;=&nbsp;&minus;3, seeds 0&ndash;3, full fits;</li>
+  <li><b>B</b>: the ev25055 light curve (1191 points, flux), cell log10&nbsp;s&nbsp;=&nbsp;0.4, log10&nbsp;q&nbsp;=&nbsp;&minus;3.889, seeds 0, 1, 2, 3, 100, 200, shortened to 25 iterations and 1 restart (a full seed of
+      this event takes 25&ndash;50 minutes).</li>
+</ul>
+<p>Seed-fitting time, median of three runs done one after another (a BOINC task was running on another core throughout):</p>
+<div class="scroll"><table>
+<tr><th>variant</th><th class="n">A (s)</th><th class="n">A speed-up</th><th class="n">B (s)</th><th class="n">B speed-up</th><th>per-seed output</th></tr>
+<tr><td>as documented: fork VBMicrolensing (<code>thread_local</code>), system malloc</td><td class="n">16.15</td><td class="n">1.00</td><td class="n">41.16</td><td class="n">1.00</td><td>reference</td></tr>
+<tr><td>VBMicrolensing with plain statics (<code>--strip</code>)</td><td class="n">11.85</td><td class="n">1.36&times;</td><td class="n">30.59</td><td class="n">1.35&times;</td><td class="ok">identical</td></tr>
+<tr><td><b>plain statics + jemalloc</b> (proposed)</td><td class="n"><b>7.90</b></td><td class="n"><b>2.04&times;</b></td><td class="n"><b>22.55</b></td><td class="n"><b>1.83&times;</b></td><td class="ok">identical</td></tr>
+<tr><td>plain statics + a free-list pool allocator (upper bound, not thread-safe, measurement only)</td><td class="n">7.33</td><td class="n">2.20&times;</td><td class="n">21.95</td><td class="n">1.88&times;</td><td class="ok">identical</td></tr>
+<tr><td><code>thread_local</code> kept + jemalloc (what the GPU apps' host side can take)</td><td class="n">12.11</td><td class="n">1.33&times;</td><td class="n">32.88</td><td class="n">1.25&times;</td><td class="ok">identical</td></tr>
+<tr><td>plain statics with <code>-O3</code>, <code>-mcpu=apple-m1</code> or LTO</td><td class="n">11.6&ndash;12.1</td><td class="n">&asymp; row 2</td><td class="n">30.2&ndash;31.2</td><td class="n">&asymp; row 2</td><td class="ok">identical</td></tr>
+<tr><td>emulated TLS (<code>-femulated-tls</code>: the default of MinGW-w64 GCC and of the Android NDK below API 29)</td><td class="n">20.52</td><td class="n">0.79&times;</td><td class="n">50.20</td><td class="n">0.82&times;</td><td class="ok">identical</td></tr>
+</table></div>
+<p>"Identical" means the same md5 of the <code>%.17g</code> output as the reference, per workload. That is expected: none of these changes alters a floating-point operation or the order of the magnification
+calls. Instruction counts agree with the times: the proposed build retires 46&nbsp;% (A) and 54&nbsp;% (B) fewer instructions than the documented one.</p>
+
+<p><b>One whole work unit</b>, <code>flux 0.2 0.2 1 -3 -3 1 log10</code> on the synthetic planet (one cell, all 240 seeds), through <code>src/fit_event.cpp</code> (the same per-WU code the BOINC wrapper runs) and
+through the shipped binary in BOINC standalone mode, each run alone:</p>
+<div class="scroll"><table>
+<tr><th>build</th><th class="n">wall time</th><th>result line</th></tr>
+<tr><td>shipped <code>kampylos_v12_macos_arm64</code> (newer toolchain: macOS SDK 27; <code>thread_local</code> library, system malloc)</td><td class="n">839&nbsp;s</td>
+    <td><code>0.200000 -3.000000 411.2228 2455999.995101 -0.100075 19.997748 6.147547 1.155625e-06 1.00143 0.29869 363.6897 61.6836 156.4001 4 4 7</code></td></tr>
+<tr><td>master, documented build (Apple clang 14 <code>-O2</code>, <code>thread_local</code> library, system malloc)</td><td class="n">1066&nbsp;s</td>
+    <td rowspan="2"><code>0.200000 -3.000000 411.2228 2455999.995102 -0.100075 19.997749 6.147548 1.155637e-06 1.00143 0.29869 363.6897 61.6836 156.4005 4 4 7</code><br>the two files are byte-identical</td></tr>
+<tr><td>master, plain statics + jemalloc</td><td class="n"><b>536&nbsp;s</b></td></tr>
+</table></div>
+<p>The shipped binary's line differs from the local builds in the last printed digits (t0 &hellip;101 vs &hellip;102, rho 1.155625e-06 vs 1.155637e-06, top3 156.4001 vs 156.4005): a different compiler rounds a few
+operations differently, as builds from different toolchains always have. The proposed change makes no difference at all within one toolchain. Applied to the shipped binary's toolchain it should give a similar
+gain (its profile has the same two overheads, in a 15&nbsp;:&nbsp;31 instead of 46&nbsp;:&nbsp;23 ratio), but that could not be measured here.</p>
+
+<h3>2.3 How to apply it (branch <code>build/faster-cpu-app</code>)</h3>
+<ol>
+  <li><b>CPU app only: strip the <code>thread_local</code> patch before building.</b> The branch adds the reverse of the existing patch script:
+<pre>python3 vendor/patch_vbm_thread_local.py --strip      # fork -> plain upstream v5.6, VBM_THREAD_SAFE removed
+# ... build the CPU app as in boinc/README.md ...
+git -C vendor/VBMicrolensing checkout -- .           # restore the fork before building a GPU app</pre>
+      <code>--strip</code> refuses to run unless it finds exactly the 242 + 1 <code>thread_local</code> statics of v5.6, and it removes the <code>VBM_THREAD_SAFE</code> marker, so a GPU app built from a stripped checkout by mistake runs its
+      completion step on one thread (<code>kampylos_cpu_patch_pool.h</code> already checks the marker) instead of corrupting the heap. The GPU apps keep the fork as it is.</li>
+  <li><b>All apps: link a faster allocator.</b> Measured with jemalloc (<code>libjemalloc.a</code> on the link line, no source change). mimalloc is the portable equivalent (Linux, Windows, macOS):
+      <code>#include &lt;mimalloc-new-delete.h&gt;</code> in one translation unit and link its library. VBMicrolensing allocates with <code>new</code>, so overriding <code>new</code>/<code>delete</code> covers the hot path.
+      The GPU apps' four completion threads benefit too (the <code>thread_local</code> + jemalloc row: 1.25&ndash;1.33&times; on the host side).</li>
+  <li><b>Check every new build</b> the way this report did: build <code>fit_event</code> the old way and the new way, run the same work unit through both and <code>cmp</code> the result files. On one toolchain they must be
+      byte-identical. <code>tests/test_cpu_resume</code> passes with the stripped library (35&nbsp;s instead of 66&nbsp;s).</li>
+</ol>
+<p><b>Other platforms (not measured).</b> On Linux a <code>thread_local</code> in the executable is a thread-pointer-relative load, so there the gain should come mostly from the allocator. Where TLS is emulated
+(MinGW-w64 GCC; Android NDK below API 29) the patch costs more than on macOS: 1.2&ndash;1.3&times; slower than the documented macOS build in the table above, 1.7&times; slower than plain statics. If the Windows or
+Android CPU apps are built that way, they gain the most.</p>
+
+<h3>2.4 What was tried in the algorithm itself: nothing material that keeps the result</h3>
+<div class="scroll"><table>
+<tr><th>idea</th><th>same result?</th><th>gain</th></tr>
+<tr><td>Early exit inside a trial evaluation: Nelder-Mead compares a reflected / expanded / contracted trial against one threshold, and a rigorous lower bound on chi2 from the points summed so far (the best
+    flux fit to those points alone) can prove a trial loses before every point is evaluated</td><td class="ok">yes, byte-identical (threshold-aware copy of <code>simplex.h</code>)</td>
+    <td>0.9&nbsp;% fewer magnification calls (0.8&nbsp;% with the points nearest the peak evaluated first): rejected trials usually lose by a narrow margin, so the bound crosses the threshold too late</td></tr>
+<tr><td>Hoist the 4&nbsp;<code>exp</code>, <code>sin</code> and <code>cos</code> of <code>BinaryLightCurve</code> out of the per-point loop (call <code>BinaryMag2</code> directly, same arithmetic)</td><td class="ok">yes, byte-identical</td><td>0.2&ndash;0.9&nbsp;% fewer instructions, no measurable time</td></tr>
+<tr><td><code>-O3</code>, <code>-mcpu=apple-m1</code>, LTO</td><td class="ok">yes, byte-identical</td><td>0&ndash;8&nbsp;%, within the noise of this host</td></tr>
+<tr><td>Evaluate the points in a different order (peak first)</td><td class="warn">chi2 identical to the printed digits, parameters not bit-identical</td><td>none by itself</td></tr>
+</table></div>
+<p>The order matters because VBMicrolensing's root solver starts from the previous call's roots (<code>zr</code> in <code>NewImages</code>, a function-local static), so a magnification can differ in its last bit
+depending on which point came before it. Two consequences worth knowing: (a) the <em>seed</em> order does not matter: seeds 0, 1, 2, 3, 100, 200 of the ev25055 cell run forwards and backwards gave
+bit-identical per-seed fits (only the cell's final re-evaluation moved, in the 13th digit), which is what the seed-split <code>part i K</code> work units and the seed-level resume rely on; (b) a resumed
+process can differ from an uninterrupted one at that level, which is why the Metal end-to-end resume test accepts rounding-level differences.</p>
+<p>Faster but <em>not</em> the same result, so not proposed (from the 2026-10-07 review): the far-field single-lens shortcut (up to ~3&times; per evaluation, changes A at the 1e-5 level), dropping the mirror-image
+half of the seeds, looser tolerances or fewer iterations.</p>
+
+<h2>3. The shipped macOS binaries are older than master</h2>
+<p>GitHub has not changed since 2026-10-11 17:05 UTC (master <code>12cb505</code>, submodule <code>a56b7bf</code>; no new pushes, PRs or issues). The binaries this host received are built from earlier code
+(<code>strings</code> on <code>projects/bitboinc.athena.org.tr/*</code>):</p>
+<div class="scroll"><table>
+<tr><th>binary (server version, received)</th><th>what it contains</th><th>what master has that it lacks</th></tr>
+<tr><td><code>kampylos_v12_macos_arm64</code> (CPU 12, 2026-10-12)</td><td>prints "v4"; seed-level checkpoint and resume ("resuming cell %d at seed %lu"); the old resume path: "checkpoint says %d cells done but the output
+    file doesn't match -- restarting from cell 0"</td><td>cell checkpoint after every cell, written atomically; resume from the complete lines of <code>out</code> (none of the messages added on 2026-10-11 is in the
+    binary: "output file holds %d complete cells", "could not write the cell checkpoint", "could not trim the output file", "this backend cannot run a seed-split work unit")</td></tr>
+<tr><td><code>kampylos_metal_v2_macos_arm64</code> (Metal 2, 2026-10-04)</td><td>prints "v1"; cell checkpoint only; "no Metal device found" &rarr; <code>boinc_finish(1)</code></td><td>in-cell checkpoint (the batched driver's
+    state); fast math switched off and verified by the self-test kernel (the binary has no <code>setFastMathEnabled:</code> / <code>setMathMode:</code> call, and with fast math on the double-single arithmetic degrades to float32: the
+    comment in <code>kampylos_metal_fit.mm</code> records the synthetic planet cell converging to chi2 692 instead of 411); command-buffer status checks and retries</td></tr>
+</table></div>
+<div class="box">Rebuild both from <code>12cb505</code> and release them as new app versions, with <code>-DKAMPYLOS_VERSION='"13"'</code> and <code>-DKAMPYLOS_METAL_VERSION=...</code> so the version printed in stderr matches the
+server's. Only the two macOS arm64 binaries were inspected; the other platforms' binaries may be in the same state. The seed-level checkpoint in the shipped CPU app does work: the two ev25055 tasks
+running on this host have seed checkpoints at seed 63 and seed 43 of 240 after 25 and 36 CPU-hours.</div>
+
+<h2>4. Open items</h2>
+<h3>4.1 Metal: a task without a device still fails the work unit</h3>
+<p><code>src/kampylos_metal_fit.mm:545</code> calls only <code>MTLCreateSystemDefaultDevice()</code>; <code>boinc/main_kampylos_metal_boinc.cpp</code> then ends the task with <code>boinc_finish(1)</code>. A task started by the BOINC daemon
+without a window-server session can get <code>nil</code> there (Apple documents that the call resolves the display's GPU and needs CoreGraphics linked), and it is then reported as a computation error.
+Branch <code>fix/metal-device-unavailable</code> (applies cleanly to master) falls back to <code>MTLCopyAllDevices()</code>, turns "no device", a failed self-test and a persistently failing command buffer into
+<code>boinc_temporary_exit(300)</code> so the task keeps its checkpoints and is retried, and links CoreGraphics. Exercised with forced-nil builds on 2026-10-12.</p>
+
+<h3>4.2 Work-unit cost estimates</h3>
+<p>The three ev25055 tasks this host received on 2026-10-14 (deadline 2026-10-28) are on course for about 96 and 199 CPU-hours each (24 and 50 minutes per seed, 240 seeds), while the 152 Kampylos tasks the host
+finished on 2026-10-12&hellip;14 took a median of 6 minutes. The server sends <code>rsc_fpops_est = 9e13</code> for them, which at this host's benchmark (5.86 GFLOPS) is 4.3 hours, 22&ndash;46&times; too low, so the client
+fetches more of them than it can finish by the deadline. The anchor line shows why they are expensive: FSPL with <code>u0 = 1.2e-12</code>, <code>tE = 1207 d</code>, <code>rho = 1e-5</code>, <code>fb = 529</code> against
+<code>fs = 0.32</code>, <code>n_peak = 1191</code> of 1191 points, <code>chi2dof_base = 0</code>. No point is on the baseline, every binary seed starts with the source inside the Einstein ring for the whole light curve, and 99&nbsp;% of
+the time is VBMicrolensing's finite-source contour integration. Two server-side options: scale <code>rsc_fpops_est</code> with the expected cost (for instance from the anchor's <code>n_peak</code>/<code>npts</code>, which the
+single-lens stage computes in a second), or screen events whose single-lens fit has no baseline before generating their grid.</p>
+
+<h3>4.3 Branches on <code>rilian/kampylos</code> (all based on <code>12cb505</code>, independent)</h3>
+<div class="scroll"><table>
+<tr><th>branch</th><th>what it does</th><th>relevance</th></tr>
+<tr><td><code>build/faster-cpu-app</code></td><td><code>--strip</code> mode for <code>vendor/patch_vbm_thread_local.py</code>; "Faster CPU build" section in <code>boinc/README.md</code></td><td class="ok">§2</td></tr>
+<tr><td><code>fix/metal-device-unavailable</code></td><td><code>MTLCopyAllDevices()</code> fallback, <code>boinc_temporary_exit</code> for transient failures, CoreGraphics linked</td><td class="ok">§4.1</td></tr>
+<tr><td><code>fix/resume-trust-output</code></td><td>resume from the complete lines of <code>out</code> even when the checkpoint lags behind; trim leaves an intact file alone and replaces one atomically; the resume test accepts
+    rounding-level differences (see §2.4) and gains two kill scenarios</td><td class="warn">only matters for multi-cell work units (e.g. the <code>ev23010_row4</code> row that took 34 hours here); single-cell ones already resume correctly</td></tr>
+<tr><td><code>fix/opencl-work-group-size</code></td><td>work-group size from <code>CL_DEVICE_MAX_WORK_GROUP_SIZE</code>, halved on <code>CL_INVALID_WORK_GROUP_SIZE</code></td><td class="warn">OpenCL devices with a limit below 128 fail every launch since the error checks of 2026-10-10; syntax-checked only</td></tr>
+<tr><td><code>docs/agents-md</code></td><td><code>AGENTS.md</code>: layout, invariants, build and test patterns</td><td>optional</td></tr>
+</table></div>
+
+<h2>5. Verification and limits</h2>
+<ul>
+  <li>Per-seed fits: identical <code>%.17g</code> output across every build variant on both workloads (§2.2).</li>
+  <li>Whole work units through <code>fit_event</code>: the documented build and the proposed build write byte-identical <code>out</code> files for the synthetic planet (§2.2) and for a cell of the bundled OGLE light curve (<code>tests/sample_ogle_blg1900.dat</code>, magnitudes, 448 points,
+      <code>mag 0.3 0.3 1 -2.5 -2.5 1 log10</code>: chi2 2811.6732 from both builds, 581&nbsp;s against 301&nbsp;s with two other processes running).</li>
+  <li>The README recipe as written (<code>--strip</code>, build, restore) was run from the repository checkout: the stripped files are upstream v5.6 line for line, the resulting <code>fit_event</code> writes an <code>out</code>
+      byte-identical to both builds above, and afterwards <code>--check</code> reports the fork restored with a clean submodule.</li>
+  <li><code>tests/test_cpu_resume</code> passes on <code>12cb505</code> with both builds.</li>
+  <li>The shipped binary gives the same result in two runs; its last-digit differences from the local builds are the toolchain (§2.2).</li>
+  <li>Timings are from one M1 that was also running a BOINC CPU task; three repeats of a variant differed by up to 10&nbsp;% (most under 5&nbsp;%), and instruction counts agree with the ratios.</li>
+  <li>Not measured: Linux and Windows builds, mimalloc, any GPU backend. The GPU statement rests on the <code>thread_local</code> + jemalloc row.</li>
+  <li>The benchmark harnesses (a per-seed driver, the threshold-aware Nelder-Mead, the pool allocator) are outside the repository; the regression inputs and <code>fit_event</code> are all that is needed to reproduce the whole-WU numbers.</li>
+</ul>
+</main>
+</body>
+</html>

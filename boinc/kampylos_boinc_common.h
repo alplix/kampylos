@@ -270,3 +270,16 @@ inline KampylosBatchedHooks kampylos_boinc_batched_hooks(int cell, int total) {
     h.keep_going = nullptr;
     return h;
 }
+
+// CPU threads for the GPU apps' completion step (src/kampylos_cpu_patch_pool.h): the whole
+// number of CPUs the client budgeted for this task -- init_data's ncpus, which is the app
+// version's avg_ncpus from the server's plan class -- and at least one. The GPU wrappers pass
+// this to kampylos_set_patch_threads() right after boinc_get_init_data(), before the first cell.
+// A budget below one CPU (the 0.1-0.25 the GPU plan classes declare today) means one thread; to
+// let the completion step use more cores, raise avg_ncpus in the plan class, not the app.
+static int kampylos_boinc_cpu_threads(const APP_INIT_DATA &aid) {
+    double budget = aid.ncpus;
+    if (!(budget >= 1.0)) return 1;            // fractional budget, or unset
+    if (budget > 1024.0) budget = 1024.0;
+    return (int)(budget + 1e-6);
+}
