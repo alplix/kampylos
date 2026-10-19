@@ -23,46 +23,36 @@ inline CompletedFit kampylos_complete_candidate(
     const CandidateResult& r,
     const Candidate& c,
     const LightCurvePoint* data,
+    int n_points,              // points in `data` (every one is needed when the bad-point list overflowed)
     double s, double q,
     double fs_bound = 1e300,   // flux_fit_bound() of the light curve (backstop, see lightcurve.h)
     double fb_offset = 0.0     // constant subtracted from every flux before upload (GPU paths
                                // centre the light curve -- see gpu_upload_light_curve())
 ) {
     CompletedFit out;
-    if (r.poisoned || r.overflow) {
+    if (r.poisoned) {
         out.chi2 = 1e18; out.fs = 0; out.fb = 0; out.dead = true;
         return out;
     }
 
-    double S_AA = r.S_AA, S_A1 = r.S_A1, S_11 = r.S_11, S_Ay = r.S_Ay, S_1y = r.S_1y, S_yy = r.S_yy;
+    double S_AA = 0, S_A1 = 0, S_11 = 0, S_Ay = 0, S_1y = 0, S_yy = 0;
     double tE = exp(c.log_tE), tE_inv = 1.0 / tE;
     double rho = exp(c.log_rho);
     double salpha = sin(c.alpha), calpha = cos(c.alpha);
 
-    // The kernel appends bad points in whatever order its threads reach the atomic counter, which
-    // varies from launch to launch; adding them to the sums in index order instead makes a
-    // candidate's chi2 reproducible run to run (and a resumed cell identical to an uninterrupted
-    // one, see kampylos_batched_fit.h).
-    int bad[KAMPYLOS_MAX_BAD_POINTS];
-    int n_bad = std::min(r.n_bad, (int)KAMPYLOS_MAX_BAD_POINTS);
-    for (int k = 0; k < n_bad; k++) bad[k] = r.bad_idx[k];
-    std::sort(bad, bad + n_bad);
-
-    for (int k = 0; k < n_bad; k++) {
-        int i = bad[k];
+    // Adds point i's real, finite-source-aware contribution to the six sums -- this is exactly
+    // the computation this whole design exists to avoid doing on the GPU (BinaryMag2 internally
+    // calls BinaryMagDark's adaptive contour integration for points like this one), done here
+    // on the CPU where the already-correct VBMicrolensing implementation already exists. False
+    // if the magnification is not finite and positive: the candidate is then dead, same as
+    // fit_binary_local's objective() returning 1e18.
+    auto add_point = [&](int i) -> bool {
         double t = data[i].t;
         double tn = (t - c.t0) * tE_inv;
         double y1 = c.u0 * salpha - tn * calpha;
         double y2 = -c.u0 * calpha - tn * salpha;
-        // The real, finite-source-aware value -- this is exactly the computation this whole
-        // design exists to avoid doing on the GPU (BinaryMag2 internally calls BinaryMagDark's
-        // adaptive contour integration for points like this one), done here on the CPU where the
-        // already-correct VBMicrolensing implementation already exists.
         double A = vbm.BinaryMag2(s, q, y1, y2, rho);
-        if (!(A > 0) || !std::isfinite(A)) {
-            out.chi2 = 1e18; out.fs = 0; out.fb = 0; out.dead = true;
-            return out;
-        }
+        if (!(A > 0) || !std::isfinite(A)) return false;
         double sigma = data[i].sigma;
         double w = 1.0 / (sigma * sigma);
         double flux = data[i].flux;
@@ -72,6 +62,44 @@ inline CompletedFit kampylos_complete_candidate(
         S_Ay += w * A * flux;
         S_1y += w * flux;
         S_yy += w * flux * flux;
+        return true;
+    };
+
+    if (r.overflow) {
+        // More bad points than the kernel can list (KAMPYLOS_MAX_BAD_POINTS): its partial sums
+        // are of no use (the points beyond the list are not even known), so this candidate gets
+        // the CPU app's objective in full, every point through BinaryMag2. Until 2026-10-19 such
+        // a candidate was declared dead (chi2 1e18) instead. On an event whose single-lens
+        // anchor has n_peak ~ npts (ev25055: 1191 points, none on the baseline) that killed 1100
+        // of the 1440 starting vertices of a cell -- most seeds collapsed on a flat 1e18
+        // landscape within 30 iterations, and the cell's result was the best of the few
+        // surviving seeds, not of the seed set the CPU app searches. Such a candidate now costs
+        // what it costs the CPU app (this is the regime where the GPU has little to offer; the
+        // seed-split work units are what keeps the task length down there).
+        for (int i = 0; i < n_points; i++) {
+            if (!add_point(i)) {
+                out.chi2 = 1e18; out.fs = 0; out.fb = 0; out.dead = true;
+                return out;
+            }
+        }
+    } else {
+        S_AA = r.S_AA; S_A1 = r.S_A1; S_11 = r.S_11; S_Ay = r.S_Ay; S_1y = r.S_1y; S_yy = r.S_yy;
+
+        // The kernel appends bad points in whatever order its threads reach the atomic counter,
+        // which varies from launch to launch; adding them to the sums in index order instead
+        // makes a candidate's chi2 reproducible run to run (and a resumed cell identical to an
+        // uninterrupted one, see kampylos_batched_fit.h).
+        int bad[KAMPYLOS_MAX_BAD_POINTS];
+        int n_bad = std::min(r.n_bad, (int)KAMPYLOS_MAX_BAD_POINTS);
+        for (int k = 0; k < n_bad; k++) bad[k] = r.bad_idx[k];
+        std::sort(bad, bad + n_bad);
+
+        for (int k = 0; k < n_bad; k++) {
+            if (!add_point(bad[k])) {
+                out.chi2 = 1e18; out.fs = 0; out.fb = 0; out.dead = true;
+                return out;
+            }
+        }
     }
 
     // The closed-form fs/fb solve is lightcurve.h's flux_fit_solve() -- the SAME function the

@@ -67,7 +67,7 @@ static std::vector<double> gpu_eval_batch(
     // history note) before this file was changed back to use it.
     // Created once, never destroyed: see kampylos_cpu_patch_pool.h (persistent workers).
     static KampylosCpuPatchPool& patch_pool = *new KampylosCpuPatchPool();   // kampylos_patch_threads() workers: the BOINC wrapper's CPU budget, else 4 with the thread_local VBMicrolensing, 1 without
-    patch_pool.complete_batch(h_res, points, ctx.h_data.data(), s, q, chi2, ctx.fs_bound, ctx.flux_offset);
+    patch_pool.complete_batch(h_res, points, ctx.h_data.data(), ctx.n_points, s, q, chi2, ctx.fs_bound, ctx.flux_offset);
     return chi2;
 }
 

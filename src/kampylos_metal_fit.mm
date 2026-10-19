@@ -753,7 +753,7 @@ static std::vector<double> metal_eval_batch(
     // bottleneck for a pathological anchor, now spread across a small worker-thread pool instead.
     // Created once, never destroyed: see kampylos_cpu_patch_pool.h (persistent workers).
     static KampylosCpuPatchPool& patch_pool = *new KampylosCpuPatchPool();   // kampylos_patch_threads() workers
-    patch_pool.complete_batch(results, points, m->h_data.data(), s, q, chi2, m->fs_bound, m->flux_offset);
+    patch_pool.complete_batch(results, points, m->h_data.data(), m->n_points, s, q, chi2, m->fs_bound, m->flux_offset);
     return chi2;
 }
 

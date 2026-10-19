@@ -197,7 +197,7 @@ static std::vector<double> opencl_eval_batch(
     // thread count is kampylos_patch_threads(): the BOINC wrapper's CPU budget, and 1 unless the
     // vendored VBMicrolensing is thread-safe).
     static KampylosCpuPatchPool& patch_pool = *new KampylosCpuPatchPool();
-    patch_pool.complete_batch(h_res, points, ctx.h_data.data(), s, q, chi2, ctx.fs_bound, ctx.flux_offset);
+    patch_pool.complete_batch(h_res, points, ctx.h_data.data(), ctx.n_points, s, q, chi2, ctx.fs_bound, ctx.flux_offset);
     return chi2;
 }
 

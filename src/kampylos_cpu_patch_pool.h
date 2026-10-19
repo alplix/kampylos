@@ -123,7 +123,7 @@ public:
     void complete_batch(
         const std::vector<CandidateResult>& results,
         const std::vector<Candidate>& points,
-        const LightCurvePoint* data,
+        const LightCurvePoint* data, int n_points,
         double s, double q,
         std::vector<double>& chi2_out,
         double fs_bound = 1e300, double fb_offset = 0.0
@@ -134,7 +134,7 @@ public:
 
         if (n_threads <= 1 || n < n_threads) {
             for (int i = 0; i < n; i++) {
-                CompletedFit cf = kampylos_complete_candidate(vbms_[0], results[i], points[i], data, s, q, fs_bound, fb_offset);
+                CompletedFit cf = kampylos_complete_candidate(vbms_[0], results[i], points[i], data, n_points, s, q, fs_bound, fb_offset);
                 chi2_out[i] = cf.chi2;
             }
             return;
@@ -142,7 +142,7 @@ public:
 
         {
             std::lock_guard<std::mutex> lk(mu_);
-            job_ = Job{ &results, &points, data, s, q, &chi2_out, fs_bound, fb_offset, n, n_threads };
+            job_ = Job{ &results, &points, data, n_points, s, q, &chi2_out, fs_bound, fb_offset, n, n_threads };
             pending_ = n_threads - 1;
             generation_++;
         }
@@ -157,6 +157,7 @@ private:
         const std::vector<CandidateResult>* results;
         const std::vector<Candidate>* points;
         const LightCurvePoint* data;
+        int n_points;
         double s, q;
         std::vector<double>* chi2_out;
         double fs_bound, fb_offset;
@@ -165,7 +166,7 @@ private:
 
     void run_share(int t, const Job& j) {
         for (int i = t; i < j.n; i += j.n_threads) {
-            CompletedFit cf = kampylos_complete_candidate(vbms_[t], (*j.results)[i], (*j.points)[i], j.data, j.s, j.q,
+            CompletedFit cf = kampylos_complete_candidate(vbms_[t], (*j.results)[i], (*j.points)[i], j.data, j.n_points, j.s, j.q,
                                                           j.fs_bound, j.fb_offset);
             (*j.chi2_out)[i] = cf.chi2;
         }

@@ -165,7 +165,7 @@ int main() {
     double worst_relerr = 0;
 
     for (int ci = 0; ci < n_cand; ci++) {
-        CompletedFit cf = kampylos_complete_candidate(vbm_ref, h_res[ci], h_cand[ci], h_data.data(), s, q);
+        CompletedFit cf = kampylos_complete_candidate(vbm_ref, h_res[ci], h_cand[ci], h_data.data(), (int)h_data.size(), s, q);
         if (h_res[ci].overflow) n_overflow++;
         if (cf.dead) { n_dead++; continue; }
         if (h_res[ci].n_bad > 0) n_with_bad++;
