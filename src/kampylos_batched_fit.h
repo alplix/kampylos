@@ -20,12 +20,29 @@
 // active set and every live NelderMeadStepper) as text; on the next call for the same cell it
 // resumes from that state. Seeds and rounds are deterministic for a given backend, so the
 // resumed cell is bit-identical to an uninterrupted one (tests/test_batched_resume.cpp).
+//
+// CHECKPOINTS INSIDE A ROUND (2026-10-19): a round is one eval() of every live stepper's pending
+// points, and on a light curve where most points need the finite-source integration a round's
+// CPU completion step can take minutes (1440 candidates x hundreds of points on one thread),
+// so a checkpoint that waits for the round boundary comes late and a kill loses the whole
+// round. The driver therefore evaluates a long round in chunks and offers the checkpoint (and
+// the stop) between chunks, keeping the chi2 already in hand in the state (`partial`): the
+// batch is a pure function of the steppers' state -- the same points in the same order on
+// every rebuild -- so a resumed round carries on from those values. The chunk size adapts to
+// the measured evaluation time; short rounds stay one eval() call, as before.
 #include <vector>
 #include <string>
 #include <sstream>
 #include <functional>
+#include <chrono>
 #include <cstdio>
 #include <cmath>
+
+// Target duration of one eval() call once rounds are long enough to be split (see above): the
+// checkpoint can then be at most about this far behind BOINC's request.
+#ifndef KAMPYLOS_BATCHED_CHUNK_SECONDS
+#define KAMPYLOS_BATCHED_CHUNK_SECONDS 15.0
+#endif
 #include "nelder_mead_stepper.h"
 #include "kampylos_gpu_types.h"
 #include "binary_fit.h"
@@ -46,11 +63,14 @@ struct KampylosBatchedHooks {
     std::function<void()> checkpoint_completed;                 // BOINC: boinc_checkpoint_completed()
     std::function<void(double)> progress;                       // fraction of THIS cell done, 0..1
     std::function<bool()> keep_going;                           // false = leave now (as a kill would)
+    int eval_chunk = 0;                                         // > 0: candidates per eval() call, fixed
+                                                                // (tests); 0: whole round, split by time
 };
 
 // The driver's state between two rounds. phase 0 is the initial pass over every seed, phases
 // 1..n_restarts the restart passes; `steppers` are the searches of the pass in progress and
-// idx[k] is the seed stepper k belongs to.
+// idx[k] is the seed stepper k belongs to. `partial` is non-empty only in a checkpoint taken
+// inside a round: the chi2 of the round's first partial.size() candidates.
 struct KampylosBatchedState {
     int cell = 0, n_seeds = 0, n_restarts = 0, phase = 0;
     long round = 0;
@@ -58,6 +78,9 @@ struct KampylosBatchedState {
     std::vector<int> active;                  // per seed: still worth restarting
     std::vector<int> idx;
     std::vector<NelderMeadStepper> steppers;
+    std::vector<double> partial;              // see above
+    int chunk = 0;                            // candidates per eval() call (0 = all); adapted at run
+                                              // time, not part of the checkpoint
 };
 
 namespace kampylos_batched_detail {
@@ -79,11 +102,12 @@ inline bool get(std::istringstream& i, std::vector<std::vector<double>>& v) {
 
 } // namespace kampylos_batched_detail
 
-// One line per item; every double at %.17g so the state round-trips exactly.
+// One line per item; every double at %.17g so the state round-trips exactly. Version 2 (2026-10-19)
+// adds the `partial` line; version 1 files (no such line) are still read.
 inline std::string kampylos_batched_state_to_text(const KampylosBatchedState& s) {
     using namespace kampylos_batched_detail;
     std::ostringstream o;
-    o << "kampylos_batched_fit 1\n";
+    o << "kampylos_batched_fit 2\n";
     o << s.cell << ' ' << s.n_seeds << ' ' << s.n_restarts << ' ' << s.phase << ' ' << s.round << '\n';
     o << s.current.size();
     for (const auto& r : s.current) { o << ' ' << (r.converged ? 1 : 0) << ' ' << r.iterations; put(o, r.fval); put(o, r.x); }
@@ -100,6 +124,7 @@ inline std::string kampylos_batched_state_to_text(const KampylosBatchedState& s)
         put(o, t.centroid); put(o, t.worst); put(o, t.xr); put(o, t.xe); put(o, t.xc);
         o << '\n';
     }
+    o << "partial"; put(o, s.partial); o << '\n';
     o << "end\n";
     return o.str();
 }
@@ -108,7 +133,7 @@ inline bool kampylos_batched_state_from_text(const std::string& text, KampylosBa
     using namespace kampylos_batched_detail;
     std::istringstream i(text);
     std::string tag; int version;
-    if (!(i >> tag >> version) || tag != "kampylos_batched_fit" || version != 1) return false;
+    if (!(i >> tag >> version) || tag != "kampylos_batched_fit" || (version != 1 && version != 2)) return false;
     KampylosBatchedState t;
     if (!(i >> t.cell >> t.n_seeds >> t.n_restarts >> t.phase >> t.round)) return false;
     size_t n;
@@ -138,6 +163,9 @@ inline bool kampylos_batched_state_from_text(const std::string& text, KampylosBa
         if (st.n < 1 || st.n > 32 || (int)st.simplex.size() != st.n + 1 || (int)st.fval.size() != st.n + 1) return false;
         t.steppers.emplace_back(st);
     }
+    if (version >= 2) {
+        if (!(i >> tag) || tag != "partial" || !get(i, t.partial)) return false;
+    }
     if (!(i >> tag) || tag != "end") return false;
     if (t.idx.size() != t.steppers.size()) return false;
     *s = std::move(t);
@@ -145,8 +173,51 @@ inline bool kampylos_batched_state_from_text(const std::string& text, KampylosBa
 }
 
 // ---- the driver ----------------------------------------------------------------------------------
-// Advances every live stepper of the pass in progress to completion, one eval() per round.
-// Returns false if hooks->keep_going() asked to stop (the state is left exactly between rounds).
+// One round's evaluations. Without hooks: one eval() call. With hooks: in chunks once a call
+// takes longer than KAMPYLOS_BATCHED_CHUNK_SECONDS (or of hooks->eval_chunk candidates when that
+// is set), with the checkpoint and the stop offered between chunks; the values already in hand
+// are carried in s.partial (see the top comment). Returns fewer values than candidates only when
+// hooks->keep_going() asked to stop -- s.partial then holds exactly what the last checkpoint
+// holds, so the caller must not advance the steppers.
+template <class Eval>
+std::vector<double> kampylos_batched_eval_round(Eval& eval, const std::vector<Candidate>& batch,
+                                                KampylosBatchedState& s, const KampylosBatchedHooks* hooks) {
+    const int n = (int)batch.size();
+    std::vector<double> chi2;
+    if (!s.partial.empty() && (int)s.partial.size() < n) chi2 = s.partial;   // resumed inside this round
+    s.partial.clear();
+    while ((int)chi2.size() < n) {
+        const int done = (int)chi2.size(), left = n - done;
+        int m = left;
+        if (hooks && hooks->eval_chunk > 0) m = std::min(left, hooks->eval_chunk);
+        else if (hooks && s.chunk > 0) m = std::min(left, s.chunk);
+        std::vector<Candidate> sub(batch.begin() + done, batch.begin() + done + m);
+        auto t0 = std::chrono::steady_clock::now();
+        std::vector<double> r = eval(sub);
+        double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        chi2.insert(chi2.end(), r.begin(), r.end());
+        if (hooks && hooks->eval_chunk <= 0) {
+            // Aim at KAMPYLOS_BATCHED_CHUNK_SECONDS per call: shrink when a call overran, grow
+            // back (towards whole rounds) when calls are short again.
+            if (dt > KAMPYLOS_BATCHED_CHUNK_SECONDS) s.chunk = std::max(16, (int)(m * KAMPYLOS_BATCHED_CHUNK_SECONDS / dt));
+            else if (s.chunk > 0 && m >= s.chunk && dt < 0.25 * KAMPYLOS_BATCHED_CHUNK_SECONDS) s.chunk *= 2;
+        }
+        if ((int)chi2.size() < n && hooks) {
+            s.partial = chi2;
+            if (hooks->time_to_checkpoint && hooks->time_to_checkpoint()) {
+                if (hooks->write_checkpoint) hooks->write_checkpoint(kampylos_batched_state_to_text(s));
+                if (hooks->checkpoint_completed) hooks->checkpoint_completed();
+            }
+            if (hooks->keep_going && !hooks->keep_going()) return chi2;
+            s.partial.clear();
+        }
+    }
+    return chi2;
+}
+
+// Advances every live stepper of the pass in progress to completion, one round at a time.
+// Returns false if hooks->keep_going() asked to stop (the state is left exactly between rounds,
+// or inside one with s.partial set).
 template <class Eval>
 bool kampylos_batched_run_pass(Eval& eval, KampylosBatchedState& s, const KampylosBatchedHooks* hooks) {
     const int n_steppers = (int)s.steppers.size();
@@ -161,9 +232,10 @@ bool kampylos_batched_run_pass(Eval& eval, KampylosBatchedState& s, const Kampyl
             pending_count[k] = (int)pts.size();
             for (const auto& p : pts) batch.push_back(kampylos_to_candidate(p));
         }
-        if (!any_active) return true;
+        if (!any_active) { s.partial.clear(); return true; }
 
-        std::vector<double> chi2 = eval(batch);
+        std::vector<double> chi2 = kampylos_batched_eval_round(eval, batch, s, hooks);
+        if ((int)chi2.size() != (int)batch.size()) return false;
 
         int offset = 0;
         for (int k = 0; k < n_steppers; k++) {

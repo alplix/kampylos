@@ -76,7 +76,7 @@ Two files in the slot directory, both written atomically (temporary file + renam
 |---|---|
 | `kampylos_checkpoint` | number of grid cells completed and written to `out`; written after every cell |
 | `kampylos_seed_checkpoint` | CPU app only: cell index, next seed, best fit so far (`src/kampylos_cpu_cell.h`); written whenever BOINC asks for a checkpoint, removed when the cell completes |
-| `kampylos_batched_checkpoint` | GPU apps only: the batched Nelder-Mead driver's full state between two rounds (`src/kampylos_batched_fit.h`), a few hundred KB of text; same timing as the seed checkpoint |
+| `kampylos_batched_checkpoint` | GPU apps only: the batched Nelder-Mead driver's full state between two rounds, or inside a long round together with the chi2 already computed for it (`src/kampylos_batched_fit.h`), a few hundred KB of text; same timing as the seed checkpoint |
 
 On a restart the app resumes from `min(kampylos_checkpoint, complete lines in out)`; the result file is the
 authoritative record of finished cells, so a missing or stale checkpoint file never costs a finished cell. Inside a
