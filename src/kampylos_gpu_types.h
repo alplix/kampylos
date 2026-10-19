@@ -28,10 +28,9 @@ struct Candidate {
 // near-peak sampling) overflowed that on 532/2001 candidates -- not rare, and the real in-event
 // cluster is wider than 64 points. Raised to 512, confirmed by the same test to clear every
 // candidate with zero overflow (max observed: see that test's own printed max_bad). `overflow`
-// stays as the safety valve for the genuinely pathological case beyond that -- the caller's
-// choice how to handle it (e.g. fall back to this candidate's GPU-only sums as an approximation,
-// or redo it entirely on the CPU, or raise this constant further), not something this file
-// decides.
+// stays as the safety valve for the genuinely pathological case beyond that; since 2026-10-19
+// kampylos_complete_candidate() redoes such a candidate entirely on the CPU (it used to declare
+// it dead, which on a light curve with no baseline killed most seeds of a cell).
 #define KAMPYLOS_MAX_BAD_POINTS 512
 
 struct CandidateResult {

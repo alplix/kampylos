@@ -74,6 +74,17 @@ in the plan class (`plan_class_spec.xml`, or the `--avg_ncpus` of the app versio
 (`fit_event`, tests) the pool keeps the compile-time default, `KAMPYLOS_PATCH_THREADS` (4 with the thread-safe
 VBMicrolensing fork, 1 otherwise). The stub takes the budget from `KAMPYLOS_STUB_NCPUS`.
 
+## Points the GPU kernel leaves to the CPU
+
+The kernels evaluate every candidate with the point-source magnification and VBMicrolensing's own quadrupole test; the
+points that fail the test (finite-source effects matter there) are listed per candidate and finished on the CPU with
+`BinaryMag2`, exactly as the CPU app computes them (`src/kampylos_gpu_complete.h`). A candidate can list up to 512 such
+points. Beyond that the kernel only reports an overflow, and since 2026-10-19 the completion step then computes that
+candidate's objective entirely on the CPU, the way the CPU app does; before, such a candidate was declared dead
+(chi2 = 1e18). On an event whose single-lens anchor shows no baseline (`n_peak` close to `npts`, e.g. ev25055) that
+killed 1100 of a cell's 1440 starting vertices, so the GPU result for the cell came from the few surviving seeds. In
+that regime the GPU app now costs about what the CPU app costs; the seed-split work units keep the task length down.
+
 ## Checkpoints and resume
 
 Two files in the slot directory, both written atomically (temporary file + rename):
