@@ -4,7 +4,9 @@
 //   2. a cell "killed" after random rounds -- repeatedly, so kills land in the initial pass and
 //      in the restart passes -- and resumed from the checkpoint each time ends bit-identical to
 //      one uninterrupted run, and a checkpoint for another cell is ignored;
-//   3. progress is reported monotonically from 0 to 1.
+//   3. the same with the rounds split into 3-candidate evaluation calls, so kills and
+//      checkpoints land inside rounds (the `partial` state, 2026-10-19);
+//   4. progress is reported monotonically from 0 to 1.
 // Uses the committed synthetic planet light curve and a handful of its seeds (minutes).
 //
 // Build (from the repo root):
@@ -119,6 +121,39 @@ int main(int argc, char** argv) {
         printf("   %d runs (%d of them interrupted)\n", runs, resumed_runs);
         check(completed, "eventually completes");
         check(resumed_runs >= 3, "at least three kills happened");
+        check(same_result(full, r), "result bit-identical to the uninterrupted run");
+    }
+
+    printf("== killed inside rounds (3 candidates per evaluation call) and resumed\n");
+    {
+        MemoryCheckpoint cp;
+        bool completed = false;
+        int runs = 0, resumed_runs = 0, partial_checkpoints = 0;
+        bool partial_round_trip = true;
+        BinaryFitResult r{};
+        long stop = 11;   // in evaluation calls now, most of them inside a round
+        while (!completed && runs < 400) {
+            cp.rounds = 0;
+            cp.stop_after = stop;
+            KampylosBatchedHooks h = cp.hooks();
+            h.eval_chunk = 3;
+            CpuEval e(data, ln_s, ln_q);
+            r = kampylos_batched_fit_seeds(e, ln_s, ln_q, seeds, 2, &h, 5, nullptr, &completed);
+            runs++;
+            if (!completed) {
+                resumed_runs++;
+                KampylosBatchedState st;
+                if (kampylos_batched_state_from_text(cp.text, &st) && !st.partial.empty()) {
+                    partial_checkpoints++;
+                    if (kampylos_batched_state_to_text(st) != cp.text) partial_round_trip = false;
+                }
+            }
+            stop = 7 + (runs * 53) % 90;   // vary the kill point
+        }
+        printf("   %d runs (%d of them interrupted, %d inside a round)\n", runs, resumed_runs, partial_checkpoints);
+        check(completed, "eventually completes");
+        check(partial_checkpoints >= 3, "at least three kills landed inside a round");
+        check(partial_round_trip, "checkpoints taken inside a round round-trip exactly");
         check(same_result(full, r), "result bit-identical to the uninterrupted run");
     }
 
