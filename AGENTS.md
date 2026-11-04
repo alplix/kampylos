@@ -211,7 +211,19 @@ clang++ -O2 -std=c++17 -fobjc-arc -I src -I $VBM -I <boinc>/api -I <boinc>/lib \
 ## Knowledge base
 
 `docs/kb/` holds this repository's known bugs and platform traps, and the bug patterns shared with the other bitboinc
-applications. Workflow: [docs/kb/shared/PROCESS.md](docs/kb/shared/PROCESS.md).
+applications. Workflow: [docs/kb/shared/PROCESS.md](docs/kb/shared/PROCESS.md). It has two parts:
+
+* **This repository's records**, edited here only: `issues/` (one file per issue, `KAM-NNN`), `ledger.md` (this
+  repository's result for every shared pattern), `kb.conf` (the issue prefix and the files that are copies of code in
+  other repositories), `README.md`, and `INDEX.md`, which `kb.py index` writes.
+* **The shared part, `docs/kb/shared/`**, the same in every bitboinc repository: the procedure (`PROCESS.md`,
+  `REFERENCE.md`), `vocabulary.md`, `boinc-api.md`, the bug patterns (`patterns/PAT-NNN-*.md`), `templates/`, the tool
+  `kb.py` and `MANIFEST`. Never change it in one repository only. After editing any file there, run
+  `python3 docs/kb/shared/kb.py sync ../nostos ../phygas ../planodia ../yarrow` from this repository, naming every
+  other bitboinc repository checked out next to this one, including any that are not public. It copies the newest
+  version of each shared file to all of them and gives each ledger an `unchecked` row for a new pattern. Then commit
+  `docs/kb` in every repository. `MANIFEST` holds the hashes of the last sync, and `kb.py lint` warns when a shared
+  file here differs from it.
 
 - Ready to fix, with next steps: `python3 docs/kb/shared/kb.py list --open --action fix` (also `--area`,
   `--platform`). Then `kb.py show KAM-NNN` for the issue and `kb.py show PAT-NNN` for the pattern it links, with the
