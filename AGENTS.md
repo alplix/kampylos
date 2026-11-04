@@ -38,8 +38,9 @@ event and days on an event whose single-lens anchor has no baseline (measurement
 | `src/model_curve_cli.cpp` | model light curve for the web site's plots (natural-log s, q) |
 | `boinc/` | the four BOINC mains, `kampylos_boinc_common.h` (input, output, checkpoints, CPU budget), `boinc/README.md` |
 | `tests/` | standalone tests (each file's header comment has its build line), `tests/boinc_stub/` (fake BOINC runtime), `tests/regression/` (end-to-end suite, expected results, synthetic planet light curve) |
+| `scripts/bench/` | speed A/B of builds on fixed work units (`mac_ab.sh` does it all on a Mac); method and results in `docs/BENCHMARK.md` |
 | `vendor/VBMicrolensing` | submodule, third-party: `alplix/VBMicrolensing` branch `thread-safe-statics` (v5.6 with `thread_local` statics, defines `VBM_THREAD_SAFE`); do not edit |
-| `vendor/patch_vbm_thread_local.py` | makes plain upstream v5.6 equivalent to the fork, or `--strip`s the fork back to upstream (CPU build) |
+| `vendor/patch_vbm_thread_local.py` | makes plain upstream v5.6 equivalent to the fork, `--strip`s the fork back to upstream (CPU build), or rewrites it with one thread_local block per function (`--block`, GPU builds) |
 | `kampylos-report-2026-10-16.html` | measurements: CPU build speed, shipped binaries, cost of no-baseline events |
 
 ## Invariants (break one and results become silently wrong)
@@ -62,8 +63,9 @@ event and days on an event whose single-lens anchor has no baseline (measurement
   temporarily (KAM-002).
 - **Determinism.** Seeds, rounds and the completion step are deterministic for one backend: bad points are added in
   index order, and within one evaluation call candidate i goes to pool thread i % n. A resumed CPU cell is
-  byte-identical to an uninterrupted one. New nondeterminism (thread order, unordered containers, uninitialised
-  fields) breaks the resume tests.
+  byte-identical to an uninterrupted one in the resume test, but a seed's fit depends on the VBMicrolensing state the
+  previous seed left, so a resume (or a seed-split part) can end a seed in another minimum (KAM-030). New
+  nondeterminism (thread order, unordered containers, uninitialised fields) breaks the resume tests.
 - **VBMicrolensing is thread-safe only when patched.** `KampylosCpuPatchPool` uses more than one thread only if the
   library header defines `VBM_THREAD_SAFE` or `VBM_THREAD_LOCAL_STATICS`. In the GPU BOINC apps the thread count is
   the client's CPU budget (`init_data` ncpus, rounded down, at least 1; since 66a1ab3). The workers are created once and
@@ -133,8 +135,9 @@ clang++ -O2 -std=c++17 -fobjc-arc -I src -I $VBM -I <boinc>/api -I <boinc>/lib \
 ```
 
 - Add the version flag of the app (Invariants). The faster CPU release build (`patch_vbm_thread_local.py --strip`, then
-  jemalloc or mimalloc, byte-identical results) is in `boinc/README.md` "Faster CPU build"; restore the fork with
-  `git -C vendor/VBMicrolensing checkout -- .` before building a GPU app.
+  jemalloc or mimalloc, byte-identical results) is in `boinc/README.md` "Faster CPU build", the faster GPU build
+  (`--block`, then the same allocator) in "Faster GPU app build"; restore the fork with
+  `git -C vendor/VBMicrolensing checkout -- .` between the two.
 - CUDA: no BOINC build line in this repository. `src/gpu_fit_binary.h` explains that the wrapper `.cpp` and the `.cu`
   file go to `nvcc` as separate inputs; `tests/test_gpu_fit_binary.cu` shows an `nvcc -gencode` line, for `sm_120`
   only. The architectures and the minimum compute capability of the shipped CUDA app are not recorded (KAM-029).
@@ -169,6 +172,9 @@ clang++ -O2 -std=c++17 -fobjc-arc -I src -I $VBM -I <boinc>/api -I <boinc>/lib \
   suite with that backend.
 - seeds or the objective -> the regression suite; a legitimate change of the numbers in
   `tests/regression/expected_results.json` is explained in the commit.
+- a speed change -> the method in `docs/BENCHMARK.md`: `scripts/bench/run_bench.sh` against the old build
+  (`build_variant.sh` with `REF=`), a gain claimed only by its rule, `same output` shown or the change explained; for
+  the GPU apps' library build or completion step also `scripts/bench/check_change.sh` on a Mac.
 - On 2026-10-27, `test_cpu_resume` built with the line in its header passed at 45a41d5 (macOS arm64, Apple clang 14).
 
 ## Environment notes
@@ -180,7 +186,8 @@ clang++ -O2 -std=c++17 -fobjc-arc -I src -I $VBM -I <boinc>/api -I <boinc>/lib \
   budget of `KAMPYLOS_STUB_NCPUS` (default 1, so a GPU wrapper on the stub runs one completion thread). It kills with
   SIGKILL only: it does not imitate the real client's quit, which flushes stdio (`docs/kb/shared/boinc-api.md`).
 - `thread_local` is expensive on macOS (`_tlv_get_addr`) and with emulated TLS (MinGW-w64 GCC, Android NDK below API
-  29); MinGW-w64 also crashes when threads with VBMicrolensing `thread_local` objects exit (KAM-010).
+  29), cheap on Linux (measured 2026-11-04, `docs/BENCHMARK.md`); MinGW-w64 also crashes when threads with
+  VBMicrolensing `thread_local` objects exit (KAM-010).
 - Windows: `boinc_fopen` text modes write CRLF (KAM-023); the stub's `boinc_fopen` is plain `fopen`.
 - Scratch binaries and work directories do not belong in the repository; `tests/test_boinc_resume.sh` takes a work dir.
 

@@ -502,6 +502,13 @@ struct CandidateResultMSL {
 // that is re-submitted after that normally completes.
 #define KAMPYLOS_METAL_BUFFER_BUDGET 4.0e6
 #define KAMPYLOS_METAL_MAX_ATTEMPTS 6
+// Pipelining of GPU and CPU completion inside a round (2026-11-04, see metal_eval_batch).
+#ifndef KAMPYLOS_METAL_PIPELINE_PARTS
+#define KAMPYLOS_METAL_PIPELINE_PARTS 4
+#endif
+#ifndef KAMPYLOS_METAL_MIN_CHUNK
+#define KAMPYLOS_METAL_MIN_CHUNK 64
+#endif
 
 // ---------------------------------------------------------------------------------------------
 // Host-side orchestration -- same shape as gpu_fit_binary.cu/kampylos_opencl_fit.cpp, differing
@@ -693,44 +700,57 @@ static std::vector<double> metal_eval_batch(
     // and re-submitted on failure. Before 2026-10-10 the whole batch went into one buffer whose
     // status was never read: an aborted buffer left the previous round's numbers in buf_res and
     // the fit went on with them.
+    //
+    // 2026-11-04, PIPELINE: the CPU completion of a chunk (kampylos_complete_candidate, the
+    // finite-source points through VBMicrolensing) used to start only after the GPU had finished
+    // the whole round, and the GPU waited idle for it before the next round. A round is now cut
+    // into at least KAMPYLOS_METAL_PIPELINE_PARTS chunks (no smaller than KAMPYLOS_METAL_MIN_CHUNK
+    // candidates); chunk k+1 is committed before the CPU waits for chunk k, so the GPU computes
+    // the next chunk while the CPU completes this one. The candidates, the kernel and the
+    // completion order are unchanged (complete_batch with first/count, see
+    // kampylos_cpu_patch_pool.h), so every chi2 is bit-identical to the unpipelined version.
+    // Whole synthetic planet cell on an M1, one completion thread: 1.12-1.14x faster, same result
+    // line; rounds of 64 candidates or fewer stay one chunk and do not change (docs/BENCHMARK.md).
     int chunk = (int)(KAMPYLOS_METAL_BUFFER_BUDGET / std::max(1, m->n_points));
     chunk = std::max(16, std::min(chunk, 4096));
-    for (int c0 = 0; c0 < n; c0 += chunk) {
-        int nc = std::min(chunk, n - c0);
-        std::string last_error;
-        bool done = false;
-        for (int attempt = 1; attempt <= KAMPYLOS_METAL_MAX_ATTEMPTS && !done; attempt++) {
-            id<MTLCommandBuffer> cmdbuf = [m->queue commandBuffer];
-            id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
-            [enc setComputePipelineState:m->pipeline];
-            [enc setBuffer:m->buf_data offset:0 atIndex:0];
-            [enc setBytes:&m->n_points length:sizeof(int) atIndex:1];
-            [enc setBytes:&s_f length:sizeof(float) atIndex:2];
-            [enc setBytes:&q_f length:sizeof(float) atIndex:3];
-            [enc setBuffer:m->buf_cand offset:c0 * sizeof(CandidateMSL) atIndex:4];
-            [enc setBytes:&nc length:sizeof(int) atIndex:5];
-            [enc setBuffer:m->buf_res offset:c0 * sizeof(CandidateResultMSL) atIndex:6];
-            // threadgroup memory lengths must be multiples of 16 bytes
-            [enc setThreadgroupMemoryLength:KAMPYLOS_MSL_NREDUCE_HOST * m->local_size * sizeof(float) atIndex:0];
-            [enc setThreadgroupMemoryLength:16 atIndex:1];
-            [enc setThreadgroupMemoryLength:16 atIndex:2];
-            [enc dispatchThreadgroups:MTLSizeMake(nc, 1, 1) threadsPerThreadgroup:MTLSizeMake(m->local_size, 1, 1)];
-            [enc endEncoding];
-            [cmdbuf commit];
+    chunk = std::min(chunk, std::max(KAMPYLOS_METAL_MIN_CHUNK, (n + KAMPYLOS_METAL_PIPELINE_PARTS - 1) / KAMPYLOS_METAL_PIPELINE_PARTS));
+    auto submit = [&](int c0, int nc) -> id<MTLCommandBuffer> {
+        id<MTLCommandBuffer> cmdbuf = [m->queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
+        [enc setComputePipelineState:m->pipeline];
+        [enc setBuffer:m->buf_data offset:0 atIndex:0];
+        [enc setBytes:&m->n_points length:sizeof(int) atIndex:1];
+        [enc setBytes:&s_f length:sizeof(float) atIndex:2];
+        [enc setBytes:&q_f length:sizeof(float) atIndex:3];
+        [enc setBuffer:m->buf_cand offset:c0 * sizeof(CandidateMSL) atIndex:4];
+        [enc setBytes:&nc length:sizeof(int) atIndex:5];
+        [enc setBuffer:m->buf_res offset:c0 * sizeof(CandidateResultMSL) atIndex:6];
+        // threadgroup memory lengths must be multiples of 16 bytes
+        [enc setThreadgroupMemoryLength:KAMPYLOS_MSL_NREDUCE_HOST * m->local_size * sizeof(float) atIndex:0];
+        [enc setThreadgroupMemoryLength:16 atIndex:1];
+        [enc setThreadgroupMemoryLength:16 atIndex:2];
+        [enc dispatchThreadgroups:MTLSizeMake(nc, 1, 1) threadsPerThreadgroup:MTLSizeMake(m->local_size, 1, 1)];
+        [enc endEncoding];
+        [cmdbuf commit];
+        return cmdbuf;
+    };
+    // Waits for the chunk's buffer and re-submits it until it completes (a chunk committed after
+    // it is already queued and simply runs first).
+    auto finish = [&](id<MTLCommandBuffer> cmdbuf, int c0, int nc) {
+        for (int attempt = 1;; attempt++) {
             [cmdbuf waitUntilCompleted];
-            if (cmdbuf.status == MTLCommandBufferStatusCompleted && cmdbuf.error == nil) { done = true; break; }
-            last_error = cmdbuf.error ? [[cmdbuf.error localizedDescription] UTF8String] : "no error object";
+            if (cmdbuf.status == MTLCommandBufferStatusCompleted && cmdbuf.error == nil) return;
+            std::string last_error = cmdbuf.error ? [[cmdbuf.error localizedDescription] UTF8String] : "no error object";
             fprintf(stderr, "metal_eval_batch: command buffer (%d candidates) failed, status %ld: %s -- attempt %d of %d\n",
                     nc, (long)cmdbuf.status, last_error.c_str(), attempt, KAMPYLOS_METAL_MAX_ATTEMPTS);
             if (attempt == 1) m->buffers_retried++;
+            if (attempt == KAMPYLOS_METAL_MAX_ATTEMPTS)
+                throw std::runtime_error("Metal command buffer failed " + std::to_string(KAMPYLOS_METAL_MAX_ATTEMPTS) +
+                                         " times in a row: " + last_error);
             usleep(200000 * attempt);
+            cmdbuf = submit(c0, nc);
         }
-        if (!done) throw std::runtime_error("Metal command buffer failed " + std::to_string(KAMPYLOS_METAL_MAX_ATTEMPTS) +
-                                            " times in a row: " + last_error);
-    }
-
-    std::vector<CandidateResultMSL> h_res_f(n);
-    memcpy(h_res_f.data(), [m->buf_res contents], n * sizeof(CandidateResultMSL));
+    };
 
     // Promote the kernel's float output into the shared (double-based) CandidateResult type so
     // kampylos_complete_candidate() -- unchanged, same as every other backend -- can patch in the
@@ -738,22 +758,30 @@ static std::vector<double> metal_eval_batch(
     // sum is a double-single pair; hi + lo in double is exact. This conversion pass is cheap
     // (plain struct field copies, no VBMicrolensing calls) and stays sequential; only the actual
     // patch-completion step below is worth parallelizing.
-    std::vector<CandidateResult> results(n);
-    for (int i = 0; i < n; i++) {
-        CandidateResult& r = results[i];
-        const CandidateResultMSL& f = h_res_f[i];
-        r.S_AA = (double)f.S_AA + (double)f.S_AA_lo; r.S_A1 = (double)f.S_A1 + (double)f.S_A1_lo;
-        r.S_11 = (double)f.S_11 + (double)f.S_11_lo; r.S_Ay = (double)f.S_Ay + (double)f.S_Ay_lo;
-        r.S_1y = (double)f.S_1y + (double)f.S_1y_lo; r.S_yy = (double)f.S_yy + (double)f.S_yy_lo;
-        r.n_bad = f.n_bad; r.overflow = f.overflow; r.poisoned = f.poisoned;
-        for (int k = 0; k < f.n_bad && k < KAMPYLOS_MAX_BAD_POINTS; k++) r.bad_idx[k] = f.bad_idx[k];
-    }
     // Same fix as gpu_fit_binary.cu's own gpu_eval_batch() (see that file and
     // kampylos_cpu_patch_pool.h for the full story) -- this was the same single-threaded
     // bottleneck for a pathological anchor, now spread across a small worker-thread pool instead.
     // Created once, never destroyed: see kampylos_cpu_patch_pool.h (persistent workers).
     static KampylosCpuPatchPool& patch_pool = *new KampylosCpuPatchPool();   // kampylos_patch_threads() workers
-    patch_pool.complete_batch(results, points, m->h_data.data(), m->n_points, s, q, chi2, m->fs_bound, m->flux_offset);
+    std::vector<CandidateResult> results(n);
+    const CandidateResultMSL* h_res_f = (const CandidateResultMSL*)[m->buf_res contents];
+    id<MTLCommandBuffer> cur = submit(0, std::min(chunk, n));
+    for (int c0 = 0; c0 < n; c0 += chunk) {
+        int nc = std::min(chunk, n - c0);
+        id<MTLCommandBuffer> next = c0 + chunk < n ? submit(c0 + chunk, std::min(chunk, n - c0 - chunk)) : nil;
+        finish(cur, c0, nc);
+        for (int i = c0; i < c0 + nc; i++) {
+            CandidateResult& r = results[i];
+            const CandidateResultMSL& f = h_res_f[i];
+            r.S_AA = (double)f.S_AA + (double)f.S_AA_lo; r.S_A1 = (double)f.S_A1 + (double)f.S_A1_lo;
+            r.S_11 = (double)f.S_11 + (double)f.S_11_lo; r.S_Ay = (double)f.S_Ay + (double)f.S_Ay_lo;
+            r.S_1y = (double)f.S_1y + (double)f.S_1y_lo; r.S_yy = (double)f.S_yy + (double)f.S_yy_lo;
+            r.n_bad = f.n_bad; r.overflow = f.overflow; r.poisoned = f.poisoned;
+            for (int k = 0; k < f.n_bad && k < KAMPYLOS_MAX_BAD_POINTS; k++) r.bad_idx[k] = f.bad_idx[k];
+        }
+        patch_pool.complete_batch(results, points, m->h_data.data(), m->n_points, s, q, chi2, m->fs_bound, m->flux_offset, c0, nc);
+        cur = next;
+    }
     return chi2;
 }
 

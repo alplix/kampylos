@@ -144,3 +144,32 @@ byte-identical (`cmp`), and so are the per-seed fits printed at `%.17g`.
 Check a new build before shipping it: build `src/fit_event.cpp` the old way and the new way, run the same work unit through
 both (e.g. the synthetic planet one above) and `cmp` the two result files. On one toolchain they must be byte-identical.
 Builds from different compilers can differ in the last printed digits, so compare like with like.
+
+These gains are macOS figures. On Linux (arm64, GCC 12, glibc 2.36, measured in a container on the same M1 on
+2026-11-04) neither change gained beyond noise: plain statics 0.97x, plus jemalloc 1.09x, because a thread_local costs a
+single load there and glibc's allocator is fast. With emulated TLS, plain statics gained 1.65x (`docs/BENCHMARK.md`,
+"Other platforms").
+
+## Faster GPU app build (same results)
+
+The GPU apps need the thread_local library (their completion threads), and on a cell where the source crosses a caustic
+they spend most of their time in it: on 60 seeds of the synthetic planet's cell the Metal app spent 13 s on the GPU and
+154 s completing the finite-source points on the CPU (2026-11-04, `docs/BENCHMARK.md`). Two build-level changes, no
+change to the search, byte-identical result files:
+
+1. **One thread_local block per function.** `python3 vendor/patch_vbm_thread_local.py --block` keeps every static
+   thread_local but gathers each function's statics into one struct, so a call pays one TLS lookup instead of one per
+   access. Restore the fork with `git -C vendor/VBMicrolensing checkout -- .` afterwards.
+2. **The faster allocator**, as for the CPU app.
+
+Measured on an Apple M1 with `scripts/bench` (profile `planet-gpu`, 3 interleaved runs each, median): Metal app 189.5 s
+with the build line above, 145.2 s with `--block`, 138.4 s with jemalloc, 112.0 s with both (1.69x); every run wrote the
+same result lines. `scripts/bench/mac_ab.sh` repeats the comparison on any Mac, and `scripts/bench/check_change.sh`
+runs the correctness checks. The same two changes apply to the CUDA and OpenCL apps, whose completion step is the same
+code; they were not measured there. What they gain depends on the platform (`docs/BENCHMARK.md`, "Other platforms"):
+`--block` gained 1.26x with emulated TLS (as MinGW-w64 GCC builds) and nothing with GCC 12 on Linux, and jemalloc gained
+nothing clear with glibc.
+
+The Metal app also overlaps GPU and CPU work inside a round (`src/kampylos_metal_fit.mm`, since 2026-11-04): 1.12-1.14x
+on a whole cell, same result line. That is a source change, so it comes with the next Metal app version, whatever the
+build line.

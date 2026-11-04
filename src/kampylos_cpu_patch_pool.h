@@ -120,20 +120,31 @@ public:
     // worth), writing chi2_out[i] for each, in the SAME order as the input. Safe to call
     // repeatedly on the same instance (that's the point -- one pool per process, reused every
     // round). Not reentrant: one batch at a time.
+    //
+    // first/count (2026-11-04): complete only candidates [first, first + count) of the batch, so a
+    // backend can complete one part of a round while the GPU still computes the next part
+    // (kampylos_metal_fit.mm). The work is split exactly as for the whole batch -- candidate i on
+    // thread i % n_threads, each thread in index order, and inline when the WHOLE batch is smaller
+    // than the pool -- so the parts of a round, completed in order, make every thread's
+    // VBMicrolensing calls the same sequence as one call for the whole round, and the chi2 are
+    // bit-identical (determinism, AGENTS.md). chi2_out must already hold results.size() values
+    // when count >= 0.
     void complete_batch(
         const std::vector<CandidateResult>& results,
         const std::vector<Candidate>& points,
         const LightCurvePoint* data, int n_points,
         double s, double q,
         std::vector<double>& chi2_out,
-        double fs_bound = 1e300, double fb_offset = 0.0
+        double fs_bound = 1e300, double fb_offset = 0.0,
+        int first = 0, int count = -1
     ) {
         int n = (int)results.size();
-        chi2_out.resize(n);
+        if (count < 0) { first = 0; count = n; chi2_out.resize(n); }
+        int end = first + count;
         int n_threads = (int)vbms_.size();
 
         if (n_threads <= 1 || n < n_threads) {
-            for (int i = 0; i < n; i++) {
+            for (int i = first; i < end; i++) {
                 CompletedFit cf = kampylos_complete_candidate(vbms_[0], results[i], points[i], data, n_points, s, q, fs_bound, fb_offset);
                 chi2_out[i] = cf.chi2;
             }
@@ -142,7 +153,7 @@ public:
 
         {
             std::lock_guard<std::mutex> lk(mu_);
-            job_ = Job{ &results, &points, data, n_points, s, q, &chi2_out, fs_bound, fb_offset, n, n_threads };
+            job_ = Job{ &results, &points, data, n_points, s, q, &chi2_out, fs_bound, fb_offset, first, end, n_threads };
             pending_ = n_threads - 1;
             generation_++;
         }
@@ -161,11 +172,12 @@ private:
         double s, q;
         std::vector<double>* chi2_out;
         double fs_bound, fb_offset;
-        int n, n_threads;
+        int first, end, n_threads;
     };
 
     void run_share(int t, const Job& j) {
-        for (int i = t; i < j.n; i += j.n_threads) {
+        int i0 = j.first + ((t - j.first % j.n_threads) + j.n_threads) % j.n_threads;   // first i >= first with i % n_threads == t
+        for (int i = i0; i < j.end; i += j.n_threads) {
             CompletedFit cf = kampylos_complete_candidate(vbms_[t], (*j.results)[i], (*j.points)[i], j.data, j.n_points, j.s, j.q,
                                                           j.fs_bound, j.fb_offset);
             (*j.chi2_out)[i] = cf.chi2;
