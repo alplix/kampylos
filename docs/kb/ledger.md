@@ -28,7 +28,7 @@ When code that a row describes changes a lot, check the pattern again and update
 | PAT-015 | affected | 2026-10-27 | 45a41d5 | KAM-006 | src/kampylos_opencl_fit.cpp:171-186 local size 128, no limit queried |
 | PAT-016 | affected | 2026-10-27 | 45a41d5 | KAM-011 | CUDA and OpenCL launch every candidate of a round (or of a 15 s chunk) at once: src/gpu_fit_binary.cu:45-48, src/kampylos_opencl_fit.cpp:184-186, not measured |
 | PAT-017 | n/a | 2026-10-27 | 45a41d5 |  | no Android GPU build here: the OpenCL loader cl_dynload.c is in the parent repository, no __ANDROID__ or dlopen in this repository, README.md lists Android for the CPU app only |
-| PAT-018 | affected | 2026-10-27 | 45a41d5 | KAM-025 | GCC 13 emits 67 FMAs in src/fit_event.cpp and 3414 in VBMicrolensingLibrary.cpp at -O2 on arm64, Apple clang 14 none (counted 2026-10-27) |
+| PAT-018 | affected | 2026-11-04 | faba573 | KAM-025, KAM-031 | no build line sets -ffp-contract; VBMicrolensing FMAs at -O2 arm64: GCC 13 3414, Apple clang 14 0, Apple clang 21 2433 |
 | PAT-019 | affected | 2026-10-27 | 45a41d5 | KAM-023 | out opened with boinc_fopen "w"/"a" (boinc/kampylos_boinc_common.h:205), checkpoint temp file "w" (:46) |
 | PAT-020 | fixed | 2026-10-27 | 45a41d5 | KAM-010 | persistent pool workers that never exit, pool never deleted: src/kampylos_cpu_patch_pool.h:52-62, 108-117, 175-191 (5a5ffff); no other threads in src/ and boinc/ |
 | PAT-021 | n/a | 2026-10-27 | 45a41d5 |  | no build scripts in this repository; the grep finds nothing; the only absolute paths are a Windows CUDA toolkit path in a build-line comment, tests/test_kampylos_opencl.cpp:14, 16 |
@@ -41,3 +41,6 @@ When code that a row describes changes a lot, check the pattern again and update
 | PAT-028 | affected | 2026-10-27 | 45a41d5 | KAM-028 | EXPECTED_GPU_VENDOR defaults to "" (src/kampylos_opencl_fit.cpp:30-32), which turns the vendor match off silently, and no build line in this repository defines it |
 | PAT-029 | n/a | 2026-10-27 | 45a41d5 |  | no script fetches anything; VBMicrolensing is pinned by the submodule commit a56b7bf; BOINC libraries, CUDA toolkit, OpenCL headers and cl_dynload come from the build machine or the parent repository (AGENTS.md, Building) |
 | PAT-030 | not-affected | 2026-10-27 | 45a41d5 |  | only the Metal fault paths (device unavailable :83, command buffers keep failing :111 in boinc/main_kampylos_metal_boinc.cpp), 300 s delay: the client gives up after about 8 h, which the comment at :10-16 intends |
+| PAT-031 | affected | 2026-11-04 | faba573 | KAM-033 | VBMicrolensing's 577 thread_local statics (fork); --strip/--block build options |
+| PAT-032 | affected | 2026-11-04 | faba573 | KAM-034 | VBMicrolensing new/delete per magnification; jemalloc build line |
+| PAT-033 | affected | 2026-11-04 | faba573 | KAM-035 | CUDA and OpenCL wait before completing a round; Metal overlaps since this branch |

@@ -1,0 +1,6 @@
+# The synthetic planet at a cell far from the planet (log10 s = 0.2, log10 q = -5), seeds k % 24 == 0. No planetary
+# caustic on the trajectory, but the event's large source (single-lens anchor rho = 0.10) still sends the points near
+# the peak to VBMicrolensing's finite-source integration.
+photometry tests/regression/synthetic_planet.dat
+in flux 0.2 0.2 1 -5 -5 1 log10 part 0 24
+ncpus 1

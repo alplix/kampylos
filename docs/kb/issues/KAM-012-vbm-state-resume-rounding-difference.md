@@ -9,7 +9,7 @@ area: determinism
 pattern:
 aliases: [B1]
 reported: 2026-10-12
-source: commit 7da5519 (2026-10-12), kampylos-report-2026-10-16.html §2.4, Metal review 2026-10-19 §4
+source: commit 7da5519 (2026-10-12), docs/BENCHMARK.md "Measurements of 2026-10-16" §2.4, Metal review 2026-10-19 §4
 where: src/kampylos_cpu_patch_pool.h:167-173 @ 45a41d5
 fixed_in:
 ---

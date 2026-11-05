@@ -1,6 +1,6 @@
 # sha256 of every file in docs/kb/shared as of the last kb.py sync; do not edit by hand
 c2df4f2896a786478c49cc8cc1bb18d520ebe80e018c42641aacd84448dee991  .gitignore
-4680d722f73aac335e9af85cc26dcd69d51c44e74e2292ef908be1b7ce26c415  PROCESS.md
+985f7973fe01d7c8a2723329c131d9688b65cb0db6b9de0e07a6db1bec44d361  PROCESS.md
 27313cb8c78b29ddda348c4ffbf9f5c343e601c68a07022d410de16e32c7d63c  REFERENCE.md
 d826f65bee48c3484385802dccdfab171fb3b2f6aab7214e0e8f6e96f4d9e42b  boinc-api.md
 ffc97e38e8f8679c8c2aba1f066bc65666fa44c866ad7e12776b1cf8114d3ea9  kb.py
@@ -21,7 +21,7 @@ cceed7bbe3f3588bff2fe7a6780d00103b1e6d7c78c37f82303af70875bee460  patterns/PAT-0
 55deea1a73a5481920afead6e24c4bca7d217971f269a93dae1912e231ec806d  patterns/PAT-015-opencl-work-group-size-hard-coded.md
 6b61ceebf510469ea8e168071afc761c0ff0ec3e394311456797bed611ba46a9  patterns/PAT-016-long-gpu-launch-hits-watchdog.md
 c0767f368a59259591b924bd421a971aa104fe69c2c20e66bca65f307aaf400b  patterns/PAT-017-android-opencl-library-not-found.md
-cd33ea53a1d06280c03a796e95c9752ed5af6cd925df0058054156d0c643ea10  patterns/PAT-018-floating-point-differs-across-platforms.md
+40d1fb85d9035930f7298a69373673b372340fc00b41e5cd5c741d2cebc2bfab  patterns/PAT-018-floating-point-differs-across-platforms.md
 563b98c8ed3d6c7228cd38a287ebdd6fe4e7f49c5073058c9411020784dc8a4e  patterns/PAT-019-text-mode-output-crlf-on-windows.md
 4ced337e98d5bea7fd29ffc363111dd1c818f329ebed0c618a15b0de7fc8d4df  patterns/PAT-020-mingw-thread-local-destructor-heap-corruption.md
 fd375522c1648d57036dc9d1dad956183aa9b1f6cab66c18d61f0f4fdff0f9cb  patterns/PAT-021-build-depends-on-developer-paths.md
@@ -34,6 +34,9 @@ b71e5f3f6937b03882c66566e0a59e7c415a48577ee891d86f35f15a34c1103f  patterns/PAT-0
 065d6bb4afd3798b9899ecd29e3970efdd4876c99dfc8fae5be0714280527af5  patterns/PAT-028-feature-silently-left-out-of-a-build.md
 3c8c304b53c611bdabb050a654b734d75904e85e94659b0d481404cec649484b  patterns/PAT-029-build-dependencies-not-pinned.md
 23581085812b25ffe966f6e442001f9d4b522224eeb19fd56bf25ef064dbbd0a  patterns/PAT-030-repeated-temporary-exits-hit-the-client-limit.md
+5c63299baf4af4775c7905f6add6c6799798a6fa2eed9fa948a56c0f105e5ee7  patterns/PAT-031-thread-local-in-hot-code-costs-a-function-call-per-access-on.md
+31df794ce92eeba8acbfb5c11a969c97ab258b37ef23542e145a4cf0a57a4142  patterns/PAT-032-small-allocations-in-a-hot-loop-are-slow-with-the-macos-syst.md
+5f355f32f9d99190289bef3f53b83afdfa4de6a8a58d8a9f473482fb1854f1f9  patterns/PAT-033-a-gpu-app-waits-for-each-launch-before-its-host-work-so-gpu.md
 7c0a506e8dc6b3d4c77c8fa61fdc6c87b362b683003f8a9ce410079d361cde03  templates/README.md
 0f05675d9bebdb4b6eb45ab2b1b7a83cb7f8624e53b60c81d7001846025dd695  templates/issue.md
 29997d29fd18f754250d67e7a72a017ee919bf403368a60cc24fc1fb921ec697  templates/ledger.md

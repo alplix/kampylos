@@ -19,7 +19,7 @@ fixed_in:
 With fast math on, the Metal app converges to the wrong solution: the true parameters of the synthetic planet
 evaluated to chi2 = 1e18 on an M1 and the cell converged to 692 instead of 411 (comment at
 `src/kampylos_metal_fit.mm:576-583`). The Metal binary shipped in early October 2026 was built that way
-(kampylos-report-2026-10-16.html §3).
+(docs/BENCHMARK.md "Measurements of 2026-10-16" §3).
 
 ## Cause
 

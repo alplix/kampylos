@@ -10,7 +10,7 @@ next: Rebase 7da5519 (tag archive/fix/resume-trust-output, conflict only in a co
 pattern: PAT-003
 aliases: [fix/resume-trust-output]
 reported: 2026-10-12
-source: review 2026-10-12 (commit 7da5519), kampylos-report-2026-10-16.html §4.3
+source: review 2026-10-12 (commit 7da5519), docs/BENCHMARK.md "Measurements of 2026-10-16" §4.3
 where: boinc/kampylos_boinc_common.h:189-203 @ 45a41d5
 fixed_in:
 ---

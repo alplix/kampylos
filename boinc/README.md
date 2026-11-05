@@ -40,6 +40,14 @@ GPU apps) so the version the app prints to stderr is the `version_num` the serve
 Run it in a directory with the two input files the app expects, `in` (one line, see `src/kampylos_wu.h`) and
 `photometry` (the event's light curve); it writes `out`. Outside a BOINC client it runs standalone.
 
+**The compiler version changes the last digits.** No build line sets `-ffp-contract`, so each compiler fuses
+multiply-adds as its default says: GCC on arm64 does (thousands of FMAs in VBMicrolensing), GCC on x86_64 without `-mfma`
+cannot, Apple clang 14 did not, and Apple clang 21 (Command Line Tools for macOS 27) does. Measured on 2026-11-04 on an
+Apple M4: the same source gives chi2 411.3206 on the planet profile with clang 21's default and 411.3205 with
+`-ffp-contract=off`, the value of the clang 14 builds, at no measured speed cost (`docs/BENCHMARK.md`, "Results on an
+Apple M4"). If results of different app versions or platforms are compared (KAM-025), add `-ffp-contract=off` to every
+compile line so a new Xcode or GCC cannot move them.
+
 ## Build (Metal, macOS)
 
 ```
@@ -144,3 +152,41 @@ byte-identical (`cmp`), and so are the per-seed fits printed at `%.17g`.
 Check a new build before shipping it: build `src/fit_event.cpp` the old way and the new way, run the same work unit through
 both (e.g. the synthetic planet one above) and `cmp` the two result files. On one toolchain they must be byte-identical.
 Builds from different compilers can differ in the last printed digits, so compare like with like.
+
+These gains are M1 figures (macOS 15). On an Apple M4 Pro with macOS 27 and Apple clang 21 (2026-11-04) the same
+build gained 1.21x: a thread_local costs little there (plain statics alone 1.07x) and jemalloc alone gave 1.13x. On
+Linux (arm64, GCC 12, glibc 2.36, in a container) plain statics change nothing, because a thread_local costs a single
+load there; jemalloc or mimalloc gained 1.10-1.11x on the quiet M4 (within noise on the loaded M1). With emulated TLS
+(MinGW-w64 GCC, which still emulates it in version 16.2) plain statics gained 1.65x on the M1 and 1.32x on the M4
+(`docs/BENCHMARK.md`, "Other platforms"). The Windows build compiles and gives the same result lines in every library
+form (MinGW-w64 GCC 16.2, run under Wine, `scripts/bench/cross_check.sh`).
+
+## Faster GPU app build (same results)
+
+The GPU apps need the thread_local library (their completion threads), and on a cell where the source crosses a caustic
+they spend most of their time in it: on 60 seeds of the synthetic planet's cell the Metal app spent 13 s on the GPU and
+154 s completing the finite-source points on the CPU (2026-11-04, `docs/BENCHMARK.md`). Two build-level changes, no
+change to the search, byte-identical result files:
+
+1. **One thread_local block per function.** `python3 vendor/patch_vbm_thread_local.py --block` keeps every static
+   thread_local but gathers each function's statics into one struct, so a call pays one TLS lookup instead of one per
+   access. Restore the fork with `git -C vendor/VBMicrolensing checkout -- .` afterwards.
+2. **The faster allocator**, as for the CPU app.
+
+Measured on an Apple M1 with `scripts/bench` (profile `planet-gpu`, 3 interleaved runs each, median): Metal app 189.5 s
+with the build line above, 145.2 s with `--block`, 138.4 s with jemalloc, 112.0 s with both (1.69x); every run wrote the
+same result lines. `scripts/bench/mac_ab.sh` repeats the comparison on any Mac, and `scripts/bench/check_change.sh`
+runs the correctness checks. The same two changes apply to the CUDA and OpenCL apps, whose completion step is the same
+code; they were not measured there. What they gain depends on the platform (`docs/BENCHMARK.md`, "Other platforms"):
+`--block` gained 1.26x with emulated TLS (as MinGW-w64 GCC builds) and nothing with GCC 12 on Linux, and jemalloc gained
+nothing clear with glibc. On the M4 Pro (macOS 27) the Metal app gained 1.09x on `planet-gpu` (62.8 s against 68.7 s):
+`--block` costs nothing there and gains nothing, jemalloc gives the rest; keep both for older Macs.
+
+The largest lever of the GPU apps is not a build flag but the number of completion threads, which the client's CPU
+budget (the plan class's `avg_ncpus`) sets: on the M4 Pro 2, 4 and 8 threads ran `planet-gpu` 1.66x, 2.52x and 3.38x
+faster than one, for 3-9 % more CPU time in total. The result lines then differ at rounding level (KAM-012), so it is a
+server-side decision.
+
+The Metal app also overlaps GPU and CPU work inside a round (`src/kampylos_metal_fit.mm`, since 2026-11-04): 1.12-1.14x
+on a whole cell on the M1, 1.03x on the M4 Pro, whose faster GPU leaves less to hide; same result line. That is a source change, so it comes with the next Metal app version, whatever the
+build line.

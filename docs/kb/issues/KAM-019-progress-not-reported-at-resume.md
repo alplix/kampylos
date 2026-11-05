@@ -19,7 +19,7 @@ fixed_in:
 
 After a restart nothing reports the resumed position until the first new seed (CPU) or round (GPU) finishes. Before
 that the task also recomputes the single-lens anchor. A CPU seed takes 24-50 minutes on events without a baseline
-(kampylos-report-2026-10-16.html §4.2), and a long GPU round minutes, so the client's progress and remaining-time
+(docs/BENCHMARK.md "Measurements of 2026-10-16" §4.2), and a long GPU round minutes, so the client's progress and remaining-time
 estimate are stale for that long.
 
 ## Cause
