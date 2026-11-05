@@ -27,8 +27,10 @@ event and days on an event whose single-lens anchor has no baseline (measurement
 | `src/lightcurve.h` | `DataPoint`, `load_photometry()` (sorts by time), `flux_fit_solve()`: the one (fs, fb) solve of every backend |
 | `src/single_lens.h`, `src/pspl_prefit.h` | the single-lens anchor (PSPL, FSPL, FSPL+LD) every cell is compared with |
 | `src/simplex.h`, `src/nelder_mead_stepper.h` | blocking Nelder-Mead (CPU) and its steppable twin (GPU batching, checkpointable state) |
-| `src/binary_fit.h` | CPU objective and fitters, `kampylos_make_seeds()`, `kampylos_seed_part()` |
-| `src/kampylos_cpu_cell.h` | CPU seed loop with the seed-level checkpoint (`KampylosCellHooks`) |
+| `src/binary_fit.h` | CPU objective (`kampylos_binary_chi2()`) and fitters, `kampylos_make_seeds()` (switch `KAMPYLOS_SEEDS_HALF`), `kampylos_seed_part()` |
+| `src/kampylos_vbm_state.h` | the state every candidate evaluation starts from: history-free evaluations (`KAMPYLOS_RESET_STATE`, KAM-030), the finite-source accuracy (`KAMPYLOS_VBM_RELTOL`); both off by default |
+| `src/kampylos_cpu_cell.h`, `src/kampylos_cpu_seed_pool.h` | CPU seed loop with the seed-level checkpoint (`KampylosCellHooks`); the seed pool of a threaded CPU app (seeds on N threads, merged in seed order) |
+| `src/kampylos_pause.h` | the pause point where helper threads wait while the task is suspended (KAM-027) |
 | `src/kampylos_batched_fit.h` | backend-independent batched driver of the GPU apps, in-cell checkpoint (state version 2), long rounds split into chunks |
 | `src/kampylos_gpu_types.h`, `src/kampylos_gpu_complete.h`, `src/kampylos_cpu_patch_pool.h` | kernel I/O structs (`KAMPYLOS_MAX_BAD_POINTS` 512), host completion of each candidate (finite-source points; whole candidate on overflow), the persistent worker pool for that step |
 | `src/kampylos_gpu_mag.cuh`, `src/kampylos_gpu_kernel.cu`, `src/gpu_fit_binary.{cu,h}` | CUDA |
@@ -40,7 +42,7 @@ event and days on an event whose single-lens anchor has no baseline (measurement
 | `tests/` | standalone tests (each file's header comment has its build line), `tests/boinc_stub/` (fake BOINC runtime), `tests/regression/` (end-to-end suite, expected results, synthetic planet light curve) |
 | `scripts/bench/` | speed A/B of builds on fixed work units (`mac_ab.sh` does it all on a Mac, `linux_ab.sh` Linux in a container, `cross_check.sh` Windows and Linux x86_64 builds under emulation); method and results in `docs/BENCHMARK.md` |
 | `vendor/VBMicrolensing` | submodule, third-party: `alplix/VBMicrolensing` branch `thread-safe-statics` (v5.6 with `thread_local` statics, defines `VBM_THREAD_SAFE`); do not edit |
-| `vendor/patch_vbm_thread_local.py` | makes plain upstream v5.6 equivalent to the fork, `--strip`s the fork back to upstream (CPU build), or rewrites it with one thread_local block per function (`--block`, GPU builds) |
+| `vendor/patch_vbm_thread_local.py` | makes plain upstream v5.6 equivalent to the fork, `--strip`s the fork back to upstream (CPU build), or rewrites it with one thread_local block per function (`--block`, GPU builds); `--reset` (warm-start methods for `KAMPYLOS_RESET_STATE`) and `--pool` (free lists for the small classes) add to any form |
 
 ## Invariants (break one and results become silently wrong)
 
@@ -63,13 +65,18 @@ event and days on an event whose single-lens anchor has no baseline (measurement
 - **Determinism.** Seeds, rounds and the completion step are deterministic for one backend: bad points are added in
   index order, and within one evaluation call candidate i goes to pool thread i % n. A resumed CPU cell is
   byte-identical to an uninterrupted one in the resume test, but a seed's fit depends on the VBMicrolensing state the
-  previous seed left, so a resume (or a seed-split part) can end a seed in another minimum (KAM-030). New
+  previous seed left, so a resume (or a seed-split part) can end a seed in another minimum (KAM-030). Built with
+  `-DKAMPYLOS_RESET_STATE=1` (and the library prepared with `--reset`), every candidate evaluation starts from a fresh
+  thread's library state (`src/kampylos_vbm_state.h`): a seed's fit and a candidate's chi2 then do not depend on what
+  ran before, on the completion-thread count or on the thread a seed ran on; the threaded CPU app relies on it. New
   nondeterminism (thread order, unordered containers, uninitialised fields) breaks the resume tests.
 - **VBMicrolensing is thread-safe only when patched.** `KampylosCpuPatchPool` uses more than one thread only if the
   library header defines `VBM_THREAD_SAFE` or `VBM_THREAD_LOCAL_STATICS`. In the GPU BOINC apps the thread count is
   the client's CPU budget (`init_data` ncpus, rounded down, at least 1; since 66a1ab3). The workers are created once and
   never exit; the pool is created with `new` and never deleted (MinGW, KAM-010). A suspend stops only the worker
-  thread, so pool threads finish their share of the current call first (KAM-027).
+  thread; since 2026-11-05 pool threads block SIGALRM and wait at `kampylos_worker_pause()` between candidates while the
+  client has the task suspended (KAM-027). The CPU app's seed pool (`src/kampylos_cpu_seed_pool.h`) follows the same
+  rules and uses more than one thread only with the thread-safe library and `KAMPYLOS_RESET_STATE`.
 - **Include order in the BOINC mains:** Kampylos headers (VBMicrolensing) before `boinc_api.h`/`filesys.h`, because
   windows.h's `scr2` macro collides with VBMicrolensing (KAM-014). Metal files need `-fobjc-arc`.
 - **Bad-point capacity:** `KAMPYLOS_MAX_BAD_POINTS` (`kampylos_gpu_types.h`, CUDA and OpenCL) and
@@ -163,12 +170,17 @@ clang++ -O2 -std=c++17 -fobjc-arc -I src -I $VBM -I <boinc>/api -I <boinc>/lib \
 | `sh tests/test_boinc_resume.sh [workdir]` | real CPU wrapper on the stub, SIGKILLed repeatedly, cell checkpoint deleted once: `out` byte-identical; stale checkpoint (ahead of `out`); the "checkpoint behind" and "torn line" cases exist only in 7da5519. `KAMPYLOS_RESUME_BACKEND=metal` runs the Metal wrapper | ~10 min |
 | `tests/test_metal_fit.mm [--cell]` | Metal objective vs CPU point by point (self-test, no Metal-only rejections); `--cell` fits a whole cell | seconds / minutes |
 | `tests/test_vbm_threads.cpp` | VBMicrolensing from 4 threads: fails on unpatched upstream, passes on the fork | seconds |
+| `tests/test_vbm_state_reset.cpp` | history-free evaluations: the same chi2 in any order through the CPU objective and the GPU completion step, seed 96 of the OGLE cell alone and in sequence (needs the `--reset` library, build in a copy) | seconds |
+| `tests/test_mirror_seeds.cpp` | the seed set is mirror pairs with equal objective at their starts; with `-DKAMPYLOS_SEEDS_HALF=1`, no pair inside the half set | seconds |
 | `tests/test_nelder_mead_stepper.cpp`, `test_ds_primitives.cpp`, `test_kampylos_mag_ds.cpp`, `test_kampylos_mag_f32.cpp`, `test_kampylos_gpu_mag.cpp` | stepper == blocking NM; double-single primitives and magnification; GPU fast-path test on the CPU | seconds |
 | `tests/test_single_lens.cpp`, `test_pspl_recovery.cpp`, `test_binary_recovery.cpp`, `test_vbm_sanity.cpp`, `test_real_data_smoke.cpp` | single-lens anchor, fit recovery, library sanity, a real light curve | seconds to minutes |
 | `tests/test_gpu_fit_binary.cu`, `test_kampylos_gpu_kernel.cu`, `test_kampylos_opencl.cpp`, `test_opencl_fit_binary.cpp` | CUDA and OpenCL against the CPU reference (need the GPU; OpenCL needs `cl_dynload.c` or an OpenCL import library) | minutes |
 | `tests/regression/run_regression.py --cli cpu=PATH [--cli metal=PATH ...]` | synthetic planet WU lands on the planet cell; backends agree; `--suite real` runs archival events. Needs the server's `kampylos_analyze.py` (`--analyze`) | minutes / hours |
 
 - `src/kampylos_wu.h`, `boinc/` -> `test_cpu_resume` + `tests/test_boinc_resume.sh`.
+- `src/kampylos_vbm_state.h`, `src/kampylos_cpu_seed_pool.h`, `vendor/patch_vbm_thread_local.py` -> `test_vbm_state_reset`,
+  `test_vbm_threads` with the changed library form, `tests/test_boinc_resume.sh` with `KAMPYLOS_STUB_NCPUS=4` for the
+  threaded CPU app, and the same result lines with the switch off as before (`scripts/bench/run_bench.sh`).
 - `src/kampylos_batched_fit.h`, `nelder_mead_stepper.h` -> `test_batched_resume` (+ the Metal resume run on a Mac).
 - a kernel, `kampylos_gpu_complete.h`, `kampylos_cpu_patch_pool.h` -> the backend's objective test and the regression
   suite with that backend.

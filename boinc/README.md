@@ -185,8 +185,44 @@ nothing clear with glibc. On the M4 Pro (macOS 27) the Metal app gained 1.09x on
 The largest lever of the GPU apps is not a build flag but the number of completion threads, which the client's CPU
 budget (the plan class's `avg_ncpus`) sets: on the M4 Pro 2, 4 and 8 threads ran `planet-gpu` 1.66x, 2.52x and 3.38x
 faster than one, for 3-9 % more CPU time in total. The result lines then differ at rounding level (KAM-012), so it is a
-server-side decision.
+server-side decision; built with history-free evaluations (below) they do not.
 
 The Metal app also overlaps GPU and CPU work inside a round (`src/kampylos_metal_fit.mm`, since 2026-11-04): 1.12-1.14x
 on a whole cell on the M1, 1.03x on the M4 Pro, whose faster GPU leaves less to hide; same result line. That is a source change, so it comes with the next Metal app version, whatever the
 build line.
+
+## Switches for the next app versions (2026-11-05)
+
+Measured on an Apple M4 Pro (`docs/BENCHMARK.md`, "Results on an Apple M4 (2026-11-05)"). All are off by default, so
+the build lines above build what they built before (the same result lines, checked).
+
+* **Free lists for the library's small objects, same results:** `python3 vendor/patch_vbm_thread_local.py --strip --pool`
+  (CPU app) or `--block --pool` (GPU apps). The CPU app 1.10x faster with jemalloc and 1.22-1.24x with the system
+  allocator, which then is as fast as jemalloc; the Metal app 1.09x; byte-identical result lines. For builds that cannot
+  link jemalloc (Windows, Android) this is the allocator gain without it; the Windows heap itself was not measured.
+* **History-free evaluations, a one-time change of results:** add `--reset` to the patch script's options and
+  `-DKAMPYLOS_RESET_STATE=1` to every compile line of the app. Every candidate evaluation then starts from the same
+  library state (`src/kampylos_vbm_state.h`): resumed tasks and seed-split parts give each seed exactly the fit of an
+  uninterrupted run (KAM-030), and the GPU apps' result no longer depends on the number of completion threads
+  (KAM-012). It costs nothing measurable. It changes results that depended on the order of calls (a 10-seed test moved
+  by -0.11 in chi2; three whole cells kept their lines), so it needs a new app version. For example:
+  ```
+  python3 vendor/patch_vbm_thread_local.py --strip --reset --pool
+  g++ -O2 -std=c++17 -DKAMPYLOS_RESET_STATE=1 -I src -I $VBM -I <boinc>/api -I <boinc>/lib -c boinc/main_kampylos_boinc.cpp -o main.o
+  g++ -O2 -std=c++17 -I $VBM -c $VBM/VBMicrolensingLibrary.cpp -o vbm.o
+  ```
+* **A threaded CPU app:** built from the thread-safe library (the fork, or `--block`) with `--reset` and
+  `-DKAMPYLOS_RESET_STATE=1`, the CPU app fits the seeds of a cell on as many threads as the client budgets CPUs for the
+  task (`init_data` ncpus, the plan class's `avg_ncpus`; `src/kampylos_cpu_seed_pool.h`), with the result of one
+  thread. Today's CPU plan class gives one CPU, and the app then runs one thread as before; an `mt` plan class with
+  `avg_ncpus` N would finish a task about N times sooner for the same CPU time, which matters most for the day-long
+  tasks of events without a baseline. The app prints `seed threads: N` at the start.
+* **Helper threads pause while the task is suspended (KAM-027):** every wrapper now points `kampylos_worker_pause()` at a
+  wait on `boinc_get_status()`, and the completion and seed threads block SIGALRM. No build change.
+* **CUDA and OpenCL round split (KAM-035):** `-DKAMPYLOS_CUDA_PIPELINE=1` / `-DKAMPYLOS_OPENCL_PIPELINE=1` overlap the GPU
+  and the host completion as the Metal app does. Not measured, and the CUDA code not even compiled: try it on a GPU host
+  before using it (the OpenCL one needs `cl_api.Flush` in cl_dynload).
+* **Search changes, for the maintainers:** `scripts/bench/patches/nm-stopping.patch` (restart only after a gain above
+  1e-3, stop a pass stalled for 100 iterations at 1e-4) takes about 2x less CPU on three whole cells with the same cell
+  chi2, with history-free evaluations on. `-DKAMPYLOS_SEEDS_HALF=1` (half of each mirror pair of seeds) lost the best
+  minimum on two of three cells: not proposed. `-DKAMPYLOS_VBM_RELTOL` changed nothing on the measured cells.

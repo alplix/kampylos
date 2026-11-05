@@ -44,8 +44,11 @@ VBM=strip bash "$here/build_variant.sh" lx-strip
 VBM=block ALLOC=jemalloc bash "$here/build_variant.sh" lx-block-jem
 VBM=strip ALLOC=jemalloc bash "$here/build_variant.sh" lx-strip-jem
 VBM=strip ALLOC=mimalloc bash "$here/build_variant.sh" lx-strip-mi
+# 2026-11-05: the free lists without an extra allocator, and with history-free evaluations (switch on)
+VBM=strip VBMX=pool bash "$here/build_variant.sh" lx-strip-pool
+VBM=strip VBMX="reset pool" OPT="-O2 -DKAMPYLOS_RESET_STATE=1" bash "$here/build_variant.sh" lx-strip-reset-pool
 LABELS="fork=$B/lx-fork/cpu block=$B/lx-block/cpu strip=$B/lx-strip/cpu block-jem=$B/lx-block-jem/cpu"
-LABELS="$LABELS strip-jem=$B/lx-strip-jem/cpu strip-mi=$B/lx-strip-mi/cpu"
+LABELS="$LABELS strip-jem=$B/lx-strip-jem/cpu strip-mi=$B/lx-strip-mi/cpu strip-pool=$B/lx-strip-pool/cpu strip-reset-pool=$B/lx-strip-reset-pool/cpu"
 if [ "${CLANG:-0}" = 1 ]; then
   echo "== $(clang++ --version | head -1)"
   CXX=clang++ VBM=fork bash "$here/build_variant.sh" lx-clang-fork

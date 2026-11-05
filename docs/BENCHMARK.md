@@ -116,9 +116,10 @@ level); otherwise the column shows the change of the first cell's chi2. `GPU%` i
 
 | file | what it does |
 |---|---|
-| `build_variant.sh <name> [patch ...]` | copies the tracked files (or `REF=<git ref>`), applies patches, prepares VBMicrolensing (`VBM=fork`, `strip` or `block`), links an allocator (`ALLOC=system`, `jemalloc` or `mimalloc`), builds `bins/<name>/cpu` and, on macOS, `bins/<name>/metal`. `OPT=` and `CXX=` set compiler and flags (`OPT="-O2 -femulated-tls"` imitates the thread_local of MinGW-w64 GCC). Linux: CPU only |
+| `build_variant.sh <name> [patch ...]` | copies the tracked files (or `REF=<git ref>`), applies patches, prepares VBMicrolensing (`VBM=fork`, `strip` or `block`; `VBMX="reset pool"` adds the patch script's `--reset` and `--pool`), links an allocator (`ALLOC=system`, `jemalloc` or `mimalloc`), builds `bins/<name>/cpu` and, on macOS, `bins/<name>/metal`. `OPT=` and `CXX=` set compiler and flags (`OPT="-O2 -femulated-tls"` imitates the thread_local of MinGW-w64 GCC). Linux: CPU only |
 | `run_bench.sh <profile> <rounds> label=binary ...` | interleaved runs in fresh directories; wall, user and system time, peak memory, a hash of the result lines, chi2 of the first cell. `RUN_PREFIX` runs every binary through a command (`taskpolicy -b`, `nice -n 19`) |
 | `summarize_bench.py <results.tsv>` | the table above |
+| `patches/censor-count.patch` | instrumentation only (2026-11-05): counts the objective evaluations by Nelder-Mead step and what a lower bound of chi2 would have let them skip; printed at exit |
 | `profiles/*.wu` | `photometry`, `in` line and CPU budget (`KAMPYLOS_STUB_NCPUS`, the completion threads of a GPU app) of one work unit |
 | `mac_ab.sh` | the documented builds of `BASE_REF` against this tree's fast builds, on all profiles |
 | `check_change.sh` | the correctness checks of the faster GPU app: library thread test, Metal objective test, Metal kill-and-resume test, same result lines with 4 completion threads |
@@ -132,6 +133,7 @@ level); otherwise the column shows the change of the first cell's chi2. `GPU%` i
 | `ogle` | `tests/sample_ogle_blg1900.dat` (448 points, magnitudes), cell (0.3, -2.5), 10 seeds | a real light curve |
 | `far` | synthetic planet, cell (0.2, -5), 10 seeds | far from the planet's mass ratio; the large source of this event (anchor rho = 0.10) still sends the points near the peak to the finite-source integration |
 | `planet-cell` | the planet cell with all 240 seeds | one whole production task; 8-18 minutes per run on the M1, 5 on the M4 Pro |
+| `ogle-cell`, `far-cell` | the OGLE and the far cell with all 240 seeds (2026-11-05) | whole cells for search changes; 3 and 4 minutes with the fast CPU build on the M4 Pro |
 
 The anchor stage (single-lens fits, before the first cell) is part of every run: 4.3 s on the planet light curve and
 1.7 s on the OGLE one with the fast CPU build. It is paid once per task, so it weighs more in these 10-seed profiles
@@ -436,6 +438,222 @@ Ordered by expected gain for volunteers; "decide" items need the maintainers.
 | Linux, Windows | CUDA, OpenCL | split each round with `complete_batch(first, count)` as the Metal app does | up to the GPU's share of a round (Metal: 1.03x on the M4, 1.13x on the M1) | needs a GPU host to test |
 | Android | CPU | `--strip` when built with an NDK below API 29 (emulated TLS) | about 1.3x (model) | not measured |
 | all | all | the search changes behind their switches, decide | 1.2-2x, other minima | Search changes above |
+
+## Results on an Apple M4 (2026-11-05)
+
+The same Apple M4 Pro as the day before (macOS 27.0, Apple clang 21.0.0 from the Command Line Tools, Homebrew jemalloc
+5.4.0, `-O2`). The BOINC client (8.2.11) was running with its tasks suspended (0 % CPU); the load average was 2.5 to 6,
+of which about 1 is the window server and the BOINC Manager window and the rest the benchmark itself (four whole cells
+at once in the whole-cell tables, one run otherwise). Spreads were below 2 % in every interleaved table. "Fast build"
+means `--strip` and jemalloc for the CPU app and `--block` and jemalloc for the Metal app, as on 2026-11-04; the
+baseline is the branch tip of 2026-11-04 (fa03bd1) built the same way. Tables of 3 rounds are interleaved, medians,
+verdict by the rule of this file; whole cells are one run per build.
+
+### History-free evaluations (`-DKAMPYLOS_RESET_STATE=1`, off by default)
+
+VBMicrolensing's root solver starts every solve from the previous solve's roots (`zr` in `NewImages`), which is why a
+seed's fit depends on the seeds before it (KAM-030) and a GPU app's result on its number of completion threads
+(KAM-012). `vendor/patch_vbm_thread_local.py --reset` adds `ResetRootWarmStart()` to the library, and with the switch
+every candidate evaluation, every final recomputation of a fit and every cell finalization starts from a fresh
+thread's state (`src/kampylos_vbm_state.h`). `tests/test_vbm_state_reset.cpp` checks it: 300 candidates of the planet
+cell in either order give the same bits through the CPU objective and through the GPU completion step, while without
+the reset 153 of the 300 differ; seed 96 of the OGLE cell gives 2833.4503 alone and after seeds 0-72. It passes with the
+`--strip` and the `--block` library.
+
+| what | switch off (this tree) against the branch tip | switch on |
+|---|---|---|
+| CPU app, `planet` / `ogle` / `far` (3 rounds) | 15.92 / 6.92 / 12.56 s against 15.91 / 6.92 / 12.63 s, same output | same line on `planet` and `ogle`; `far` chi2 -0.1119 (another, better minimum) |
+| Metal app, `planet-gpu` (3 rounds, 1 thread) | 64.01 s against 63.72 s, same output | chi2 +0.0001 |
+| whole planet, OGLE and far cells (CPU app) | | the same result lines as the branch tip (chi2 411.2228, 2810.4678, 714.1706) |
+| fixed work: 300 candidates, objective / completion step | | 0.160-0.165 s / 0.100-0.103 s with and without the reset |
+
+The reset costs nothing: on a fixed set of candidates the time is the same. The wall time of a profile still moves (CPU
+app `planet` 1.13x faster, `far` 1.16x slower, Metal `planet-gpu` 1.07x slower) because the seeds take other paths: the
+instrumented build below counts 16956 evaluations instead of 20184 on `planet` and 22338 instead of 20404 on `far`.
+That is the one-time change of results that the switch makes, and the reason it needs a new app version.
+
+The completion threads no longer change the result (Metal app, `planet-gpu`, one run each):
+
+| completion threads | 1 | 2 | 4 | 8 |
+|---|---|---|---|---|
+| switch on: seconds, result | 67.83 | 40.47 | 26.30 | 19.51, the same line at every count |
+| branch tip | 64.47 | | 25.28 (chi2 -0.0006 against 1 thread) | |
+
+### Where the time goes now
+
+* **CPU app** (fast build with the reset, `sample` of the planet cell): the polynomial root finders 61 %
+  (`cmplx_laguerre2newton` 39 %, `cmplx_newton_spec` 16 %, `cmplx_roots_gen` 4 %, `solve_quadratic_eq` 2 %),
+  `NewImages` 13 %, ordering the images and the skip lists 8 %, allocation 5.5 % plus 1.5 % in jemalloc's thread lookup
+  (`pthread_getspecific`).
+* **Metal app** (`planet-gpu`, one completion thread): the completion thread has the same mix (root finders about 60 % of
+  its samples); the GPU waits most of the time. A GPU version of the finite-source integration would therefore be a
+  kernel of root solves at fixed contour samples, with the image ordering on the host. Not started: it changes results
+  at the accuracy of the integration and needs an fp64 GPU for CUDA and OpenCL.
+* **Evaluations by kind** (`scripts/bench/patches/censor-count.patch`, profile `planet`, branch tip): 20184 evaluations,
+  47 % reflections, 6 % expansions, 25 % contractions, 20 % shrink vertices, 1 % initial vertices. The finite-source
+  points are 67 % of the cost on `planet`, 20 % on `ogle` and 55 % on `far`.
+* **The anchor stage** takes 2.44 s on the planet light curve and 1.08 s on the OGLE one (fast build): 15 % of a 10-seed
+  profile, under 1 % of a whole cell. It matters only for work units split into many short parts.
+* **BOINC priority on a Mac.** `nice -n 19` runs at full speed (13.85 s against 13.75 s on `planet`); background QoS
+  (`taskpolicy -b`) puts the process on the efficiency cores and takes 3.76x as long (51.69 s). The BOINC client 8.2.11
+  binary imports `setpriority()` and no QoS call, and its one running task had nice 10, so the client lowers the
+  priority with nice: volunteers' tasks keep the performance cores, and the numbers in this file apply to them (KAM-038).
+
+### Censored evaluations: measured, not worth doing
+
+Nelder-Mead compares a trial point's chi2 with a value it knows beforehand and never stores a rejected one (a
+reflection is rejected at or above the second-worst vertex, an expansion at or above the reflection, a contraction at or
+above the worst vertex). An evaluation could stop as soon as a lower bound of its chi2 (the least-squares chi2 of the
+points computed so far, with their own best fs and fb) reaches that value. `scripts/bench/patches/censor-count.patch`
+counts how much finite-source work that would save, with the points in time order and with the point-source points
+first:
+
+| profile | rejected trial points | cost saved, point-source points first | cost saved, time order | bound above the true chi2 |
+|---|---|---|---|---|
+| `planet` | 6561 of 15869 | 0.6 % | 0.5 % | never |
+| `ogle` | 5744 of 13987 | 0.0 % | 0.0 % | never |
+| `far` | 6376 of 14884 | 0.2 % | 0.4 % | never |
+
+A rejected trial point's chi2 is close above its threshold, and the bound from the point-source points alone is far
+below it, because the finite-source points carry the fit. Dropped; nothing in the apps changed.
+
+### Free lists for VBMicrolensing's small objects (`--pool`, same results, KAM-036)
+
+`vendor/patch_vbm_thread_local.py --pool` gives the seven small classes the magnification allocates per point and per
+contour sample (`_point`, `_curve`, `_skiplist_curve`, `_theta`, `_thetas`, `annulus`, `_sols_for_skiplist_curve`) an
+`operator new`/`delete` with a free list (plain statics in the `--strip` form, `thread_local` in the thread-safe forms).
+Every pair below wrote the same result lines; `tests/test_vbm_threads.cpp` passes with the `--block` library and its
+thread_local free lists.
+
+| build (switch on) | `planet` median s | `ogle` median s | output |
+|---|---|---|---|
+| CPU app, jemalloc | 14.10 | 6.95 | |
+| + free lists | 12.85 (1.10x, ACCEPT) | 6.31 (1.10x, ACCEPT) | same |
+| CPU app, macOS system allocator | 15.82 | 7.89 | same |
+| + free lists | 12.94 (1.22x, ACCEPT) | 6.38 (1.24x, ACCEPT) | same |
+| CPU app, `--block` with `-femulated-tls` (the MinGW-w64 model), system allocator | 17.43 | 8.59 | same |
+| + free lists | 14.79 (1.18x, ACCEPT) | 7.26 (1.18x, ACCEPT) | same |
+| Metal app, `planet-gpu`, jemalloc | 66.85 | | |
+| + free lists | 61.45 (1.09x, ACCEPT) | | same |
+
+With the free lists the system allocator is as fast as jemalloc (12.94 s against 12.85 s): builds that cannot link
+jemalloc (Windows, where it was never measured, and Android) get the allocator gain without it. On Linux arm64 in the
+container (`linux_ab.sh`, GCC 12.2, glibc 2.36, `planet`, 3 rounds, switch off) the free lists beat jemalloc: plain
+statics 18.88 s, with jemalloc 17.10 s (1.10x), with the free lists 16.27 s (1.16x), same output (with the switch on as
+well, 14.56 s, the same line; the difference to 16.27 s is the reset's other search paths on this profile, as on the
+Mac, not a speed-up). The Windows heap was not measured.
+
+### Threaded CPU app (seeds on N threads, needs the switch and the thread-safe library)
+
+`src/kampylos_cpu_seed_pool.h`: with a CPU budget of N (the client's `ncpus`, an `mt` plan class's `avg_ncpus`) the CPU
+app fits the seeds of a cell on N threads, each taking the next seed when it is free, and merges them in seed order, so
+progress, seed checkpoints and the result are those of one thread. It needs the thread-safe library (`--block` here)
+and history-free evaluations, and otherwise keeps one thread. The whole planet cell (240 seeds), one run each:
+
+| build | wall s | CPU s | against 1 thread | output |
+|---|---|---|---|---|
+| `--strip`, 1 thread (today's CPU app, with the switch) | 312.45 | 312.0 | | |
+| `--block`, 1 thread | 350.22 | 349.3 | 1.00x | same |
+| 2 threads | 183.38 | 359.3 | 1.91x | same |
+| 4 threads | 95.93 | 361.9 | 3.65x | same |
+| 8 threads | 54.15 | 383.9 | 6.47x | same |
+
+Every thread count wrote the branch tip's line for this cell, byte for byte. The thread-safe library costs 12 % on one
+thread (`--strip` is the faster single-thread form); with 8 threads the task finishes 5.8x sooner than today's CPU app
+for 23 % more CPU time. Whether to offer it is a plan-class decision (KAM-040). While the stub reported the task as
+suspended, the 4-thread app used 0.05 s of CPU in 10 s (KAM-027).
+
+### Search changes on whole cells, with history-free evaluations
+
+All builds but the first have the switch on; one run each, four at a time (wall seconds, the CPU time is within 0.5 % of
+it; speed-ups against the switch-on build; "same" = the branch tip's result line, byte for byte):
+
+| build | planet cell | OGLE cell | far cell |
+|---|---|---|---|
+| branch tip (switch off) | 326 s, chi2 411.2228 | 174 s, chi2 2810.4678 | 246 s, chi2 714.1706 |
+| switch on | 326 s, same | 169 s, same | 247 s, same |
+| half the seeds (`KAMPYLOS_SEEDS_HALF=1`) | 156 s (2.09x), chi2 411.2228 (the mirror solution) | 82 s (2.06x), **chi2 2833.4503 (+22.98)** | 131 s (1.88x), **chi2 748.6989 (+34.53)** |
+| `KAMPYLOS_VBM_RELTOL=1e-3` | 325 s, same | 169 s, same | 243 s, same |
+| `KAMPYLOS_VBM_RELTOL=1e-4` | 324 s, same | 169 s, same | 246 s, same |
+| restart only after a gain above 1e-3 (`nm-stopping.patch`) | 271 s (1.20x), same | 138 s (1.22x), same | 213 s (1.16x), same |
+| that and stop a pass stalled for 100 iterations at 1e-4 | 168 s (1.94x), same | 76 s (2.23x), same | 122 s (2.02x), chi2 714.1706, other digits |
+
+The same builds on the 10-seed profiles (3 rounds, against the switch-on build):
+
+| build | `planet` | `ogle` | `far` |
+|---|---|---|---|
+| switch on | 14.30 s | 6.97 s | 14.62 s |
+| `KAMPYLOS_VBM_RELTOL=1e-3` | 14.73 s, same | 6.98 s, same | 13.18 s (1.11x), other line, same chi2 to 4 decimals |
+| `KAMPYLOS_VBM_RELTOL=1e-4` | 14.30 s, same | 6.97 s, same | 14.66 s, same |
+| restart rule | 13.15 s (1.09x), same | 6.24 s (1.12x), same | 13.98 s (1.05x, no clear gain), same |
+| restart and stall rules | 9.68 s (1.48x), same chi2 | 3.85 s (1.81x), same chi2 | 7.90 s (1.85x), same chi2 |
+
+* **Half the seeds: not proposed.** Each seed set is 120 mirror pairs, (u0, alpha) and (-u0, -alpha), which give the same
+  light curve (`src/binary_fit.h`, "MIRROR PAIRS"; `tests/test_mirror_seeds.cpp` checks the pairing and that the two
+  starts of a pair have the same chi2 to 1e-9). Dropping one of each pair halves the work, and on the planet cell the
+  kept half found the same minimum in its mirror form (u0 +0.100075, alpha 0.135638 instead of -0.100075, 6.147547). On
+  the OGLE and far cells it lost the best minimum by 23 and 35 in chi2: the two runs of a pair start with different
+  simplex steps and are independent attempts, and both are needed. A server that compares results should treat
+  (u0, alpha) and (-u0, 2 pi - alpha) as the same solution (KAM-039).
+* **A relative tolerance for the finite-source integration: no effect here.** VBMicrolensing's `RelTol` loosens the
+  integration only where it is coarser than the absolute `Tol` of 1e-2, that is above a magnification of 10 (1e-3) or 100
+  (1e-4); the finite-source points of these three cells are below that. It may help a high-magnification event; not
+  measured.
+* **The stopping rules: the strongest search change measured so far.** With history-free evaluations, restarting only
+  after a gain above 1e-3 and stopping a pass after 100 iterations without a gain of 1e-4 takes 1.94-2.23x less CPU on
+  the three whole cells and gives the same cell chi2 to four decimals on all three (the same bytes on the planet and
+  OGLE cells). On the M1 without the reset the same rules moved the OGLE cell by -0.94 (2026-11-04): each seed now ends
+  where its own rule takes it, not where its predecessor's state does. A decision for the maintainers, with more cells
+  (the regression suite's real events) before it goes into an app (KAM-037). The GPU driver has the same switches: the
+  Metal app with both rules took 27.20 s on `planet-gpu` against 67.10 s (2.47x, 3 rounds, ACCEPT), chi2 0.0005 lower.
+
+### CUDA and OpenCL: written, not measured (KAM-035, KAM-011)
+
+The Metal app's split of a round (chunk k+1 on the GPU while the host completes chunk k) is now in the CUDA and OpenCL
+hosts as well, behind `-DKAMPYLOS_CUDA_PIPELINE=1` and `-DKAMPYLOS_OPENCL_PIPELINE=1`, off by default; the chunk rule is
+shared (`kampylos_gpu_round_chunk()`), and the Metal app uses it with the same constants as before. Not run: the CUDA
+code was not compiled (no toolkit here), the OpenCL code passes a syntax check against Apple's OpenCL headers and a
+stand-in for `cl_dynload.h`, which must provide `clFlush`.
+
+### GPU app against CPU app by task size (from the measurements above, one completion thread)
+
+| seeds per task | CPU app | Metal app | faster |
+|---|---|---|---|
+| 10 (`far`, 2026-11-04) | 12.5 s | 16.5 s | CPU app, 1.32x |
+| 60 (`planet-gpu`; the CPU app's time estimated from its whole planet cell: 1.35 s per seed plus the anchor) | about 83 s | 63.7 s | Metal app, about 1.3x |
+| 240 (the whole planet cell; Metal 2026-11-04) | 326 s | 293 s | Metal app, 1.11x |
+
+On a caustic-crossing cell a GPU task with one completion thread is only as fast as a CPU task, and on a few seeds it
+is slower. GPU tasks want whole cells and more completion threads (KAM-032); CPU tasks can be split finer.
+
+### Checks of this tree (2026-11-05, M4)
+
+* `tests/test_vbm_state_reset.cpp` passes with the `--strip --reset` and the `--block --reset` library; `test_cpu_resume`,
+  `test_batched_resume`, `test_nelder_mead_stepper` and `test_mirror_seeds` (also with `-DKAMPYLOS_SEEDS_HALF=1`) pass
+  with the switches off and on; `tests/test_vbm_threads.cpp` passes with the `--block --pool` library.
+* `scripts/bench/check_change.sh`: PASS (library thread test, Metal objective test, Metal kill-and-resume test in 214 s,
+  the same result lines with 4 completion threads as `upstream/master`'s Metal build).
+* `tests/test_boinc_resume.sh` with the threaded CPU app (4 threads, switch on): the killed and restarted run and the
+  stale-checkpoint run are byte-identical to the uninterrupted one.
+* With the switches off this tree writes the branch tip's result lines on every profile above (CPU and Metal apps),
+  checked again after the last change (`planet`, `ogle`, `far`, `planet-gpu`, within 1.6 % in time).
+* `scripts/bench/cross_check.sh planet 1 "fork block strip strip+reset+pool block+reset+pool"` (forms with `+` are new):
+  the CPU app for Windows (MinGW-w64 GCC 16.2, static, run by Wine) and Linux x86_64 (GCC 12.2), both under Rosetta,
+  compiles, links and runs to the end in all five forms, including the threaded CPU app's library form and the new
+  switches; within each platform every form writes the same lines (chi2 411.3205 on Windows, 411.3207 on Linux x86_64,
+  as on 2026-11-04). `scripts/bench/linux_ab.sh 3` (Linux arm64, GCC 12.2): every build the same lines.
+* Not run: CUDA and OpenCL (no fp64 GPU here), the regression suite (it needs the server's `kampylos_analyze.py`).
+
+### Next steps (2026-11-05)
+
+| platform | app | step | expected | evidence |
+|---|---|---|---|---|
+| all | all | decide: history-free evaluations (`KAMPYLOS_RESET_STATE=1` with `--reset`) in the next app versions | no speed change; exact resumes and seed-split parts; GPU results independent of the thread count; needed for the threaded CPU app | above, KAM-030, KAM-012 |
+| all | all | release builds with `--pool` | 1.09-1.10x with jemalloc, 1.18-1.24x without it | above |
+| all | CPU | decide: an `mt` plan class for the CPU app (seed threads, KAM-040) | 1.9x, 3.7x, 6.5x shorter tasks at 2, 4, 8 threads, 3-10 % more CPU | above |
+| all | all | decide: the stopping rules, after the regression suite's real events | about 2x on whole cells, same chi2 on three cells | above |
+| Linux, Windows | CUDA, OpenCL | build with `KAMPYLOS_CUDA_PIPELINE` / `KAMPYLOS_OPENCL_PIPELINE` on a GPU host, compare and time | up to the GPU's share of a round | KAM-035 |
+| all GPU apps | Metal, CUDA, OpenCL | decide: `avg_ncpus` of the GPU plan classes (KAM-032); with the switch on the result no longer depends on it | 1.7-3.5x on caustic cells | above |
 
 ## Other platforms
 

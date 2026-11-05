@@ -22,7 +22,19 @@ struct APP_INIT_DATA {
     double ncpus = 1;   // the client's CPU budget for the task (app version avg_ncpus)
 };
 
+struct BOINC_STATUS {   // the fields of BOINC's struct, in its order
+    int no_heartbeat = 0;
+    int suspended = 0;
+    int quit_request = 0;
+    int reread_init_data_file = 0;
+    int abort_request = 0;
+    double working_set_size = 0;
+    double max_working_set_size = 0;
+    int network_suspended = 0;
+};
+
 inline void boinc_options_defaults(BOINC_OPTIONS& o) { o = BOINC_OPTIONS(); }
+int boinc_get_status(BOINC_STATUS*);
 int boinc_init_options(BOINC_OPTIONS*);
 int boinc_finish(int status);
 int boinc_temporary_exit(int delay, const char* reason = 0, bool is_notice = false);

@@ -5,6 +5,8 @@
 #   patches (git diff format, -p1), prepares VBMicrolensing and builds bins/<name>/cpu (and bins/<name>/metal on macOS).
 #   env: VBM    fork (default: the submodule as it is, thread_local statics), strip or block
 #               (vendor/patch_vbm_thread_local.py --strip / --block)
+#        VBMX   extra options of vendor/patch_vbm_thread_local.py, without the dashes, applied to any VBM form
+#               (e.g. VBMX=reset: the root solver's warm-start methods that -DKAMPYLOS_RESET_STATE=1 needs)
 #        ALLOC  system (default), jemalloc (JEMALLOC = static library or linker flags; default: Homebrew's
 #               libjemalloc.a on macOS, -ljemalloc elsewhere) or mimalloc (MIMALLOC, default -lmimalloc: on Linux
 #               the shared library replaces malloc by symbol order; on macOS give flags that really override it)
@@ -39,11 +41,14 @@ else
 fi
 for p in "$@"; do a="$(cd "$(dirname "$p")" && pwd)/$(basename "$p")"; (cd "$T" && patch -p1 -s < "$a"); done
 VBCPP=$T/vendor/VBMicrolensing/VBMicrolensing/lib/VBMicrolensingLibrary.cpp
+XOPTS=""; for x in ${VBMX:-}; do XOPTS="$XOPTS --$x"; done
 case $VBMMODE in
-  fork) ;;
-  strip|block) (cd "$T" && python3 vendor/patch_vbm_thread_local.py --$VBMMODE > /dev/null) ;;
+  fork) if [ -n "$XOPTS" ]; then (cd "$T" && python3 vendor/patch_vbm_thread_local.py $XOPTS > /dev/null); fi ;;
+  strip|block) (cd "$T" && python3 vendor/patch_vbm_thread_local.py --$VBMMODE $XOPTS > /dev/null) ;;
   *) echo "VBM must be fork, strip or block"; exit 2 ;;
 esac
+case " ${VBMX:-} " in *" reset "*) grep -q VBM_KAMPYLOS_RESET "$T/vendor/VBMicrolensing/VBMicrolensing/lib/VBMicrolensingLibrary.h" ||
+  { echo "this tree's patch_vbm_thread_local.py has no --reset"; exit 1; } ;; esac
 # an older patch script ignores an option it does not know (--block before 2026-11-04)
 if [ $VBMMODE = strip ] && grep -q 'thread_local static' "$VBCPP"; then echo "--strip left thread_local statics"; exit 1; fi
 if [ $VBMMODE = block ] && ! grep -q '_vbm_tls_t' "$VBCPP"; then echo "this tree's patch_vbm_thread_local.py has no --block"; exit 1; fi
@@ -70,4 +75,4 @@ for b in $BACKENDS; do
   [ -f "$out/$b.exe" ] && mv -f "$out/$b.exe" "$out/$b"
   [ -x "$out/$b" ] || { grep -E 'error' "$log" | head; echo "build of $b failed, see $log"; exit 1; }
 done
-echo "built $out: $(cd "$out" && ls | tr '\n' ' ')(${REF:-working tree} VBM=$VBMMODE ALLOC=$ALLOC OPT=$OPT)"
+echo "built $out: $(cd "$out" && ls | tr '\n' ' ')(${REF:-working tree} VBM=$VBMMODE${VBMX:+ VBMX=$VBMX} ALLOC=$ALLOC OPT=$OPT)"

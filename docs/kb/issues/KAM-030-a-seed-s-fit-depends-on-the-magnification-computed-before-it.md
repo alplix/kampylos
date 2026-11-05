@@ -2,7 +2,7 @@
 id: KAM-030
 title: A seed's fit depends on the magnification computed before it, so a resumed or seed-split task can end a seed in another minimum
 type: bug
-status: new
+status: fix-proposed
 severity: medium
 platforms: [all]
 area: determinism
@@ -58,11 +58,25 @@ resumed task, a seed-split part and the whole cell give each seed the same fit, 
 rule become predictable. For the GPU apps the same reset before each candidate's completion would make the result
 independent of the completion-thread count (KAM-012); not tried.
 
+Proposed on 2026-11-05, behind a switch that is off by default (history-free evaluations,
+`src/kampylos_vbm_state.h`): `vendor/patch_vbm_thread_local.py --reset` adds `ResetRootWarmStart()` to the library
+(it clears the root solver's warm start `zr` in `NewImages`, the one array that carries state from one solve to the
+next), and with `-DKAMPYLOS_RESET_STATE=1` every candidate evaluation, final recomputation and cell finalization starts
+from it, on every backend. Exact by construction (a fresh thread's state, not "two fixed magnifications that happen to
+be enough") and free: on a fixed set of 300 candidates the objective and the GPU completion step take the same time
+with and without it. Measured on an Apple M4 Pro (docs/BENCHMARK.md, Results on an Apple M4 (2026-11-05)): seed 96
+of the OGLE cell gives 2833.4503 alone and after seeds 0-72; the whole planet, OGLE and far cells write the same result
+lines as without the switch; the 10-seed `far` profile moves (chi2 -0.11, a better minimum) because its seeds no longer
+inherit their predecessors' state; the Metal app writes the same line with 1, 2, 4 and 8 completion threads (KAM-012).
+
 ## Test
 
-Not covered: `tests/test_boinc_resume.sh` passes on a subsampled light curve where the effect did not show. A test
-would fit one seed of the OGLE cell alone and after another seed and compare the results.
+`tests/test_vbm_state_reset.cpp` (2026-11-05, build line in its header; needs the `--reset` library): 300 candidates
+of the planet cell in both orders through the CPU objective and through the GPU completion step must give the same
+bits, the same loop without the reset must not (153 of 300 differ), and seed 96 of the OGLE cell alone and after seeds
+0-72 must give the same fit. Passes with the `--strip` and `--block` libraries.
 
 ## Log
 
 - 2026-11-04: created from the speed benchmark; reproduced with the trace harness (fast CPU build, Apple M1).
+- 2026-11-05: 2026-11-05: history-free evaluations behind -DKAMPYLOS_RESET_STATE=1 (vendor/patch_vbm_thread_local.py --reset, src/kampylos_vbm_state.h), tests/test_vbm_state_reset.cpp, measured on the M4 (docs/BENCHMARK.md)

@@ -36,10 +36,30 @@ app 1.30x faster, 1.69x together with jemalloc (docs/BENCHMARK.md). It works on 
 patched upstream) and keeps the VBM_THREAD_SAFE marker; restore the plain fork with
 `git -C vendor/VBMicrolensing checkout -- .`.
 
+--reset (2026-11-05) can be added to any of the forms above (or given alone on the fork). It
+adds three public methods, ResetRootWarmStart(), GetRootWarmStart() and SetRootWarmStart(),
+which clear, read and write the warm start of the binary-lens root solver: the five roots of the
+previous call (`zr` in NewImages), from which cmplx_roots_gen() starts the next solve. That array
+is the reason a magnification depends in its last bits on the call before it, and through
+Nelder-Mead a seed's fit on the seed before it (KAM-030, KAM-012). Cleared, it holds what a fresh
+thread starts with (every root 0). The library's own code never reaches the new hook (it is a call
+of NewImages without coefficients), so without calls of the new methods the results are
+bit-identical; the header defines VBM_KAMPYLOS_RESET.
+
+--pool (2026-11-05) can be added to any form as well. It gives the seven small classes the binary-lens
+magnification allocates and frees for every point and contour sample (_point, _curve, _skiplist_curve,
+_theta, _thetas, annulus, _sols_for_skiplist_curve) their own operator new and delete with a free list:
+a freed object is kept for the next allocation of the same class instead of going back to malloc. The
+lists are thread_local in the thread-safe forms (the fork, --block) and plain statics with --strip; they
+never shrink (the peak is bounded by one magnification's contour). Allocation does not touch the
+arithmetic, so the results are bit-identical; the header defines VBM_KAMPYLOS_POOL.
+
 Usage (from the repo root, after `git submodule update --init`):
     python3 vendor/patch_vbm_thread_local.py            # patch
     python3 vendor/patch_vbm_thread_local.py --strip    # undo (CPU app build)
     python3 vendor/patch_vbm_thread_local.py --block    # one thread_local block per function (GPU app build)
+    python3 vendor/patch_vbm_thread_local.py --strip --reset   # either form, plus the warm-start methods
+    python3 vendor/patch_vbm_thread_local.py --block --pool    # either form, plus the free lists
     python3 vendor/patch_vbm_thread_local.py --check    # exit 0 if patched, 1 if not
 """
 import re
@@ -191,6 +211,134 @@ HDR_BLOCK = [
 ]
 
 
+RESET_MARK = "#define VBM_KAMPYLOS_RESET 1"
+NEWIMAGES = re.compile(r"^_curve\* VBMicrolensing::NewImages\(complex yi, complex\* coefs, _theta\* theta\) \{\r?\n", re.M)
+BINARYMAG2_DECL = re.compile(r"^\tdouble BinaryMag2\(double s, double q, double y1, double y2, double rho\);(\r?\n)", re.M)
+CLASS_LINE = re.compile(r"^class VBMicrolensing(\r?\n)", re.M)
+RESET_HOOK = """\t// kampylos (vendor/patch_vbm_thread_local.py --reset): a call without coefficients reads (yi = 1),
+\t// writes (yi = 2) or clears (yi = 0) the root solver's warm start zr, so that the caller can make
+\t// a magnification independent of the calls before it (kampylos KAM-030). The library never calls
+\t// NewImages without coefficients, so its own results do not change.
+\tif (!coefs) {
+\t\tdouble* b = (double*)(void*)theta;
+\t\tfor (int i = 0; i < 5; i++) {
+\t\t\tif (yi.re == 1) { b[2 * i] = zr[i].re; b[2 * i + 1] = zr[i].im; }
+\t\t\telse if (yi.re == 2) zr[i] = complex(b[2 * i], b[2 * i + 1]);
+\t\t\telse zr[i] = complex(0., 0.);
+\t\t}
+\t\treturn 0;
+\t}
+"""
+RESET_METHODS = """
+// kampylos (vendor/patch_vbm_thread_local.py --reset): the warm start of the root solver, see the
+// hook at the top of NewImages(complex, complex*, _theta*).
+void VBMicrolensing::ResetRootWarmStart() { NewImages(complex(0., 0.), 0, 0); }
+void VBMicrolensing::GetRootWarmStart(double* re_im) { NewImages(complex(1., 0.), 0, (_theta*)(void*)re_im); }
+void VBMicrolensing::SetRootWarmStart(const double* re_im) { NewImages(complex(2., 0.), 0, (_theta*)(void*)const_cast<double*>(re_im)); }
+"""
+RESET_DECLS = ["\t// kampylos (vendor/patch_vbm_thread_local.py --reset): the root solver's warm start, 5 roots as",
+               "\t// 10 doubles (re, im); cleared = what a fresh thread starts with",
+               "\tvoid ResetRootWarmStart();",
+               "\tvoid GetRootWarmStart(double* re_im);",
+               "\tvoid SetRootWarmStart(const double* re_im);"]
+
+
+def add_reset(cpp, hdr):
+    """The --reset additions (see the docstring). Returns (cpp, hdr), or None if the library is not the expected one."""
+    if RESET_MARK in hdr:
+        return cpp, hdr
+    m = NEWIMAGES.search(cpp)
+    d = BINARYMAG2_DECL.search(hdr)
+    c = CLASS_LINE.search(hdr)
+    if not m or not d or not c or len(NEWIMAGES.findall(cpp)) != 1:
+        print("--reset: NewImages(complex, complex*, _theta*), the BinaryMag2 declaration or the class line is not as in v5.6")
+        return None
+    at = cpp.find("\ty = yi + coefs[11];", m.end())
+    if at < 0 or "\n}" in cpp[m.end():at]:
+        print("--reset: the first statement of NewImages is not where v5.6 has it")
+        return None
+    cpp = cpp[:at] + RESET_HOOK + cpp[at:]
+    cpp = cpp.rstrip("\r\n") + "\n" + RESET_METHODS
+    eol = d.group(1)
+    hdr = hdr[:d.end()] + eol.join(RESET_DECLS) + eol + hdr[d.end():]
+    c = CLASS_LINE.search(hdr)
+    hdr = hdr[:c.start()] + RESET_MARK + c.group(1) + hdr[c.start():]
+    return cpp, hdr
+
+
+POOL_MARK = "#define VBM_KAMPYLOS_POOL 1"
+POOL_CLASSES = ["struct annulus {", "class _theta {", "class _thetas {", "class _point {", "class _curve {",
+                "class _skiplist_curve {", "class _sols_for_skiplist_curve {"]
+POOL_CODE = [
+    "// kampylos (vendor/patch_vbm_thread_local.py --pool): a free list per small class, see the script's docstring.",
+    "#include <cstddef>",
+    "#include <new>",
+    "struct _vbm_free_node { _vbm_free_node* next; };",
+    "template <class T> struct _vbm_pool {",
+    "\tstatic _vbm_free_node*& head() { %s _vbm_free_node* h = nullptr; return h; }",
+    "\tstatic void* get(std::size_t n) {",
+    "\t\tif (n == sizeof(T)) { _vbm_free_node*& h = head(); if (h) { _vbm_free_node* p = h; h = p->next; return p; } }",
+    "\t\treturn ::operator new(n);",
+    "\t}",
+    "\tstatic void put(void* p, std::size_t n) {",
+    "\t\tif (!p) return;",
+    "\t\tif (n == sizeof(T)) { _vbm_free_node*& h = head(); _vbm_free_node* q = (_vbm_free_node*)p; q->next = h; h = q; return; }",
+    "\t\t::operator delete(p);",
+    "\t}",
+    "};",
+    "#define VBM_POOLED(T) static void* operator new(std::size_t n) { return _vbm_pool<T>::get(n); } \\",
+    "\tstatic void operator delete(void* p, std::size_t n) { _vbm_pool<T>::put(p, n); }",
+]
+
+
+def add_pool(hdr):
+    """The --pool additions (header only). Returns the new header, or None if it is not the expected one."""
+    if POOL_MARK in hdr:
+        return hdr
+    m = re.search(r"^struct annulus \{(\r?\n)", hdr, re.M)
+    if not m or any(hdr.count(c) != 1 for c in POOL_CLASSES):
+        print("--pool: the small classes of the header are not as in v5.6")
+        return None
+    eol = m.group(1)
+    tls = "thread_local static" if ("VBM_THREAD_SAFE" in hdr or MARK in hdr) else "static"
+    code = eol.join(POOL_CODE).replace("%s", tls) + eol
+    for c in POOL_CLASSES:
+        at = hdr.index(c)
+        line_end = hdr.index("\n", at) + 1
+        name = c.split()[1]
+        insert = "\tVBM_POOLED(%s)%s" % (name, eol)
+        if c.startswith("class"):     # after the `public:` line that follows
+            pub = hdr.index("public:", line_end)
+            line_end = hdr.index("\n", pub) + 1
+        hdr = hdr[:line_end] + insert + hdr[line_end:]
+    at = hdr.index("struct annulus {")
+    hdr = hdr[:at] + POOL_MARK + eol + code + eol + hdr[at:]
+    return hdr
+
+
+def finish(cpp, hdr, orig_cpp, orig_hdr):
+    """Applies the options that add to any form (--reset, --pool) and writes what changed."""
+    if "--pool" in sys.argv:
+        h2 = add_pool(hdr)
+        if h2 is None:
+            return 1
+        if h2 != hdr:
+            print("--pool: free lists for the %d small classes" % len(POOL_CLASSES))
+        hdr = h2
+    if "--reset" in sys.argv:
+        r = add_reset(cpp, hdr)
+        if r is None:
+            return 1
+        if r[1] != hdr:
+            print("--reset: added ResetRootWarmStart(), GetRootWarmStart() and SetRootWarmStart()")
+        cpp, hdr = r
+    if cpp != orig_cpp:
+        open(CPP, "w", newline="").write(cpp)
+    if hdr != orig_hdr:
+        open(HDR, "w", newline="").write(hdr)
+    return 0
+
+
 def main():
     check_only = "--check" in sys.argv
     strip = "--strip" in sys.argv
@@ -198,8 +346,9 @@ def main():
     if not os.path.isfile(CPP) or not os.path.isfile(HDR):
         print("VBMicrolensing sources not found under %s (run: git submodule update --init)" % LIB)
         return 2
-    hdr = open(HDR).read()
-    cpp = open(CPP).read()
+    hdr = open(HDR, newline="").read()
+    cpp = open(CPP, newline="").read()
+    orig_cpp, orig_hdr = cpp, hdr
     # the alplix/VBMicrolensing fork (the submodule) defines VBM_THREAD_SAFE instead of our marker
     patched = (MARK in hdr or "VBM_THREAD_SAFE" in hdr) and "thread_local static" in cpp
     if check_only:
@@ -210,7 +359,7 @@ def main():
             print("the library is in --block form: restore the fork first (git -C vendor/VBMicrolensing checkout -- .)")
             return 1
         print("already patched (one thread_local block per function)")
-        return 0
+        return finish(cpp, hdr, orig_cpp, orig_hdr)
     if block:
         n_cpp = len(CPP_TLS.findall(cpp))
         if not patched or n_cpp != EXPECTED_CPP:
@@ -224,15 +373,13 @@ def main():
         cpp2, n_funcs, n_vars = to_blocks(cpp)
         for a, b in HDR_BLOCK:
             hdr = hdr.replace(a, b)
-        open(CPP, "w").write(cpp2)
-        open(HDR, "w").write(hdr)
         print("gathered the %d thread_local declarations (%d variables) of %s into one block per function (%d functions)"
               % (n_cpp, n_vars, os.path.relpath(CPP), n_funcs))
-        return 0
+        return finish(cpp2, hdr, orig_cpp, orig_hdr)
     if strip:
         if not patched and "thread_local static" not in cpp:
             print("already plain (no thread_local statics)")
-            return 0
+            return finish(cpp, hdr, orig_cpp, orig_hdr)
         n_cpp = len(CPP_TLS.findall(cpp))
         n_hdr = len(HDR_TLS.findall(hdr))
         if n_cpp != EXPECTED_CPP or n_hdr != EXPECTED_HDR:
@@ -241,14 +388,12 @@ def main():
             return 1
         cpp2 = CPP_TLS.sub(r"\1static\2", cpp)
         hdr2 = MARKER_LINES.sub("", HDR_TLS.sub(r"\1static\2", hdr))
-        open(CPP, "w").write(cpp2)
-        open(HDR, "w").write(hdr2)
         print("stripped %d thread_local statics in %s and %d in %s (marker removed)"
               % (n_cpp, os.path.relpath(CPP), n_hdr, os.path.relpath(HDR)))
-        return 0
+        return finish(cpp2, hdr2, orig_cpp, orig_hdr)
     if patched:
         print("already patched")
-        return 0
+        return finish(cpp, hdr, orig_cpp, orig_hdr)
     n_cpp = len(CPP_STATIC.findall(cpp))
     n_hdr = len(HDR_STATIC.findall(hdr))
     if n_cpp != EXPECTED_CPP or n_hdr != EXPECTED_HDR:
@@ -258,10 +403,8 @@ def main():
     cpp2 = CPP_STATIC.sub(r"\1thread_local static\2", cpp)
     hdr2 = HDR_STATIC.sub(r"\1thread_local static\2", hdr)
     hdr2 = hdr2.replace("#pragma once", "#pragma once\n" + MARK, 1) if "#pragma once" in hdr2 else MARK + "\n" + hdr2
-    open(CPP, "w").write(cpp2)
-    open(HDR, "w").write(hdr2)
     print("patched %d statics in %s and %d in %s" % (n_cpp, os.path.relpath(CPP), n_hdr, os.path.relpath(HDR)))
-    return 0
+    return finish(cpp2, hdr2, orig_cpp, orig_hdr)
 
 
 if __name__ == "__main__":

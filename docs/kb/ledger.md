@@ -42,5 +42,5 @@ When code that a row describes changes a lot, check the pattern again and update
 | PAT-029 | n/a | 2026-10-27 | 45a41d5 |  | no script fetches anything; VBMicrolensing is pinned by the submodule commit a56b7bf; BOINC libraries, CUDA toolkit, OpenCL headers and cl_dynload come from the build machine or the parent repository (AGENTS.md, Building) |
 | PAT-030 | not-affected | 2026-10-27 | 45a41d5 |  | only the Metal fault paths (device unavailable :83, command buffers keep failing :111 in boinc/main_kampylos_metal_boinc.cpp), 300 s delay: the client gives up after about 8 h, which the comment at :10-16 intends |
 | PAT-031 | affected | 2026-11-04 | faba573 | KAM-033 | VBMicrolensing's 577 thread_local statics (fork); --strip/--block build options |
-| PAT-032 | affected | 2026-11-04 | faba573 | KAM-034 | VBMicrolensing new/delete per magnification; jemalloc build line |
+| PAT-032 | affected | 2026-11-04 | faba573 | KAM-034, KAM-036 | VBMicrolensing new/delete per magnification; jemalloc build line |
 | PAT-033 | affected | 2026-11-04 | faba573 | KAM-035 | CUDA and OpenCL wait before completing a round; Metal overlaps since this branch |

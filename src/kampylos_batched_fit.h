@@ -47,6 +47,18 @@
 #include "kampylos_gpu_types.h"
 #include "binary_fit.h"
 
+// Candidates per GPU launch inside one eval() call (the Metal app's rule of 2026-11-04, shared with CUDA and
+// OpenCL on 2026-11-05 for KAM-035 and KAM-011): at most `budget` candidate x point evaluations per launch (a
+// short launch is what keeps a GPU watchdog away and a failed launch cheap to redo), and at least `parts`
+// launches of at least `min_chunk` candidates when the round is long enough, so the host completes chunk k
+// while the GPU computes chunk k+1 (PAT-033). The chunks change nothing in the results: each candidate is
+// completed by the same pool thread in the same order as in one launch (kampylos_cpu_patch_pool.h).
+inline int kampylos_gpu_round_chunk(int n, int n_points, double budget, int parts, int min_chunk) {
+    int chunk = (int)(budget / std::max(1, n_points));
+    chunk = std::max(16, std::min(chunk, 4096));
+    return std::min(chunk, std::max(min_chunk, (n + parts - 1) / parts));
+}
+
 static inline Candidate kampylos_to_candidate(const std::vector<double>& x) {
     Candidate c;
     c.t0 = x[0]; c.u0 = x[1]; c.log_tE = x[2]; c.alpha = x[3]; c.log_rho = x[4];

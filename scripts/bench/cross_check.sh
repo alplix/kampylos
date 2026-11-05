@@ -8,7 +8,9 @@
 #   env: KAMPYLOS_WORK (default ~/kampylos-work; the container works in $KAMPYLOS_WORK/x86), MINGW_CXX (default
 #        x86_64-w64-mingw32-g++, found on the host: brew install mingw-w64 on a Mac), DOCKER (default docker)
 # Labels: win-<form> (MinGW-w64, static, run by Wine) and lx64-<form> (Linux x86_64 GCC), for each VBMicrolensing form
-# (fork = thread_local library as boinc/README.md builds it, block = --block, strip = plain statics). Within one
+# (fork = thread_local library as boinc/README.md builds it, block = --block, strip = plain statics; since 2026-11-05 a
+# form may add the patch script's extras with "+", e.g. strip+reset+pool, and "reset" then also builds with
+# -DKAMPYLOS_RESET_STATE=1). Within one
 # platform every form must write the same result lines; between platforms they may differ at rounding level (KAM-025),
 # and the table shows whether they do.
 # MinGW-w64 GCC implements thread_local with emulated TLS (__emutls_get_address, checked with GCC 16.2 on 2026-11-04);
@@ -16,6 +18,10 @@
 set -e -o pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 repo="$(cd "$here/../.." && pwd)"
+# form "strip+reset+pool" -> VBM=strip, VBMX="reset pool", and the switch of history-free evaluations if reset is in it
+form_vbm() { echo "${1%%+*}"; }
+form_vbmx() { case $1 in *+*) echo "${1#*+}" | tr '+' ' ' ;; esac; }
+form_opt() { case "+$1+" in *+reset+*) echo "-DKAMPYLOS_RESET_STATE=1" ;; esac; }
 PROFILE=${1:-planet}
 ROUNDS=${2:-1}
 FORMS=${3:-fork block strip}
@@ -29,7 +35,8 @@ if [ -z "${CROSS_CHECK_INSIDE:-}" ]; then
   echo "== Windows builds: $($MINGW_CXX --version | head -1)"
   # Static: no libstdc++/libgcc/libwinpthread DLLs to ship or to find under Wine
   for f in $FORMS; do
-    KAMPYLOS_WORK=$W CXX=$MINGW_CXX OPT="-O2 -static" BACKENDS=cpu VBM=$f bash "$here/build_variant.sh" win-$f
+    KAMPYLOS_WORK=$W CXX=$MINGW_CXX OPT="-O2 -static $(form_opt $f)" BACKENDS=cpu VBM=$(form_vbm $f) VBMX="$(form_vbmx $f)" \
+      bash "$here/build_variant.sh" win-$f
   done
   mkdir -p "$W/image"
   if ! $D image inspect $IMAGE > /dev/null 2>&1; then
@@ -53,7 +60,7 @@ B=$W/bins
 echo "== Linux builds: $(g++ --version | head -1), $(ldd --version 2>&1 | head -1), $(uname -m); $(wine --version 2>/dev/null)"
 LABELS=""
 for f in $FORMS; do
-  VBM=$f bash "$here/build_variant.sh" lx64-$f
+  OPT="-O2 $(form_opt $f)" VBM=$(form_vbm $f) VBMX="$(form_vbmx $f)" bash "$here/build_variant.sh" lx64-$f
   # run_bench.sh runs a label's file directly; Wine needs the .exe name and its own launcher
   mkdir -p "$W/wrap"
   cp "$B/win-$f/cpu" "$B/win-$f/cpu.exe"

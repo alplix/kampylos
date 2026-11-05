@@ -711,9 +711,8 @@ static std::vector<double> metal_eval_batch(
     // kampylos_cpu_patch_pool.h), so every chi2 is bit-identical to the unpipelined version.
     // Whole synthetic planet cell on an M1, one completion thread: 1.12-1.14x faster, same result
     // line; rounds of 64 candidates or fewer stay one chunk and do not change (docs/BENCHMARK.md).
-    int chunk = (int)(KAMPYLOS_METAL_BUFFER_BUDGET / std::max(1, m->n_points));
-    chunk = std::max(16, std::min(chunk, 4096));
-    chunk = std::min(chunk, std::max(KAMPYLOS_METAL_MIN_CHUNK, (n + KAMPYLOS_METAL_PIPELINE_PARTS - 1) / KAMPYLOS_METAL_PIPELINE_PARTS));
+    const int chunk = kampylos_gpu_round_chunk(n, m->n_points, KAMPYLOS_METAL_BUFFER_BUDGET, KAMPYLOS_METAL_PIPELINE_PARTS,
+                                              KAMPYLOS_METAL_MIN_CHUNK);
     auto submit = [&](int c0, int nc) -> id<MTLCommandBuffer> {
         id<MTLCommandBuffer> cmdbuf = [m->queue commandBuffer];
         id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
@@ -828,6 +827,7 @@ BinaryFitResult metal_fit_binary_multistart(
     BinaryFitResult out = metal_fit_binary_seeds(ctx, data, log_s, log_q, seeds, n_restarts);
     std::vector<double> mag(data.size());
     double pr[7] = { log_s, log_q, out.u0, out.alpha, log(out.rho), log(out.tE), out.t0 };
+    kampylos_vbm_prepare(vbm);
     for (size_t i = 0; i < data.size(); i++) mag[i] = vbm.BinaryLightCurve(pr, data[i].t);
     FluxFit ff = linear_flux_fit(data, mag);
     out.fs = ff.fs; out.fb = ff.fb;

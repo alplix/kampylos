@@ -66,6 +66,11 @@
 #include <mutex>
 #include <condition_variable>
 #include "kampylos_gpu_complete.h"
+#include "kampylos_pause.h"
+#if !defined(_WIN32)
+#include <pthread.h>
+#include <signal.h>
+#endif
 
 // Default worker count. More than one thread is only safe with the thread_local-patched
 // VBMicrolensing described above; vendor/patch_vbm_thread_local.py applies that patch and
@@ -178,6 +183,7 @@ private:
     void run_share(int t, const Job& j) {
         int i0 = j.first + ((t - j.first % j.n_threads) + j.n_threads) % j.n_threads;   // first i >= first with i % n_threads == t
         for (int i = i0; i < j.end; i += j.n_threads) {
+            if (t > 0) kampylos_worker_pause();   // KAM-027: wait here while the task is suspended (kampylos_pause.h)
             CompletedFit cf = kampylos_complete_candidate(vbms_[t], (*j.results)[i], (*j.points)[i], j.data, j.n_points, j.s, j.q,
                                                           j.fs_bound, j.fb_offset);
             (*j.chi2_out)[i] = cf.chi2;
@@ -185,6 +191,14 @@ private:
     }
 
     void worker_loop(int t) {
+#if !defined(_WIN32)
+        // 2026-11-05, KAM-027: BOINC's timer signal must reach the main thread, where the runtime suspends the
+        // task; a pool thread that received it would be put to sleep instead of the main thread.
+        sigset_t set;
+        sigemptyset(&set);
+        sigaddset(&set, SIGALRM);
+        pthread_sigmask(SIG_BLOCK, &set, nullptr);
+#endif
         unsigned long long seen = 0;
         for (;;) {
             Job j;
