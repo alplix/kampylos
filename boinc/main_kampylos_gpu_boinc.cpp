@@ -59,6 +59,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "boinc_init_options failed: %d\n", rc);
         return rc;
     }
+    kampylos_boinc_install_worker_pause();   // completion threads wait while the task is suspended (KAM-027)
 
     // Prefer app_init_data's gpu_device_num over "--device N", 2026-10-05: see the OpenCL
     // wrappers' fuller comment (forum report: two GPU tasks always running on the same

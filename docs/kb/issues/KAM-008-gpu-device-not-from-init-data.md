@@ -36,7 +36,7 @@ added the BOINC wrappers to this repository, already contains the fix: `git log 
 
 Metal has no device choice: the system default device, else the non-low-power device of `MTLCopyAllDevices()`
 (`src/kampylos_metal_fit.mm:548-566`). Apple Silicon has one GPU, and the Metal binary seen on a volunteer host is
-`kampylos_metal_v2_macos_arm64` (kampylos-report-2026-10-16.html §3); an Intel Mac with two GPUs would ignore BOINC's
+`kampylos_metal_v2_macos_arm64` (docs/BENCHMARK.md "Measurements of 2026-10-16" §3); an Intel Mac with two GPUs would ignore BOINC's
 assignment, should a Metal build for x86_64 ever be shipped. The `init_data` code of both wrappers is not behind any
 preprocessor guard, so every build has it. Still open on the OpenCL side: the index is applied to a list that is not BOINC's
 (KAM-022).

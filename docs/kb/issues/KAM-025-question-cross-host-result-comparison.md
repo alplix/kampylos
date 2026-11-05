@@ -27,7 +27,7 @@ Known differences (not re-measured on 2026-10-27):
 * between backends, by design: the Metal kernel uses float-float arithmetic and the GPU paths sum in another order;
   the final values are recomputed on the host, but the fit can end at a slightly different point;
 * between toolchains: the shipped macOS CPU binary and a local build of the same source differ in the last printed
-  digits (kampylos-report-2026-10-16.html §2.2);
+  digits (docs/BENCHMARK.md "Measurements of 2026-10-16" §2.2);
 * between completion thread counts and after resumes (KAM-012).
 
 No build line sets `-ffp-contract` (`git grep` for `ffp-contract`, `ffast-math`, `march` finds nothing). Counted on
@@ -55,3 +55,4 @@ None until answered. If a comparison exists: a cross-platform diff of `fit_event
 - 2026-10-27: recorded while checking PAT-018.
 - 2026-10-27: re-checked after PAT-018 was corrected: replaced a wrong statement about compiler defaults by FMA
   counts of GCC 13 and Apple clang 14.
+- 2026-11-04: measured across platforms (docs/BENCHMARK.md, Other platforms, M4): on the planet profile the CPU app writes chi2 411.3206 with Apple clang 21 (default contraction), 411.3205 with clang 21 -ffp-contract=off, clang 14, Linux arm64 GCC 12/clang 14 and Windows MinGW-w64 GCC 16, 411.3207 with Linux x86_64 GCC 12; every platform gives other hashes of the full line. The Xcode version alone moves the Mac results (KAM-031); more completion threads move the GPU results (KAM-032).

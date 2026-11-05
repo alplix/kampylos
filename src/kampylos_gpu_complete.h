@@ -10,6 +10,7 @@
 #include "kampylos_gpu_types.h"
 #include "lightcurve.h" // flux_fit_solve(): the one fs/fb solve shared with the CPU path
 #include "VBMicrolensingLibrary.h"
+#include "kampylos_vbm_state.h"
 
 struct CompletedFit {
     double chi2, fs, fb;
@@ -35,6 +36,9 @@ inline CompletedFit kampylos_complete_candidate(
         return out;
     }
 
+    // -DKAMPYLOS_RESET_STATE=1: every candidate starts from the same library state, so its chi2 does not
+    // depend on the candidates this completion thread did before (KAM-012, kampylos_vbm_state.h).
+    kampylos_vbm_prepare(vbm);
     double S_AA = 0, S_A1 = 0, S_11 = 0, S_Ay = 0, S_1y = 0, S_yy = 0;
     double tE = exp(c.log_tE), tE_inv = 1.0 / tE;
     double rho = exp(c.log_rho);

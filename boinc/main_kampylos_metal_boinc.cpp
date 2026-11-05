@@ -54,6 +54,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "boinc_init_options failed: %d\n", rc);
         return rc;
     }
+    kampylos_boinc_install_worker_pause();   // completion threads wait while the task is suspended (KAM-027)
 
     // The completion step's CPU threads (src/kampylos_cpu_patch_pool.h) follow the client's CPU
     // budget for this task, see kampylos_boinc_cpu_threads(). Until 2026-10-19 the pool took

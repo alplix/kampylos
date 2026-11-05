@@ -1,0 +1,222 @@
+diff --git a/src/binary_fit.h b/src/binary_fit.h
+index 113d097..28eb273 100644
+--- a/src/binary_fit.h
++++ b/src/binary_fit.h
+@@ -26,6 +26,21 @@
+ #define M_PI 3.14159265358979323846
+ #endif
+ 
++// Benchmark experiment (scripts/bench/patches/nm-stopping.patch, docs/BENCHMARK.md), not in the
++// apps: stop a binary-fit Nelder-Mead pass when its best chi2 has not improved by more than
++// KAMPYLOS_NM_STALL_TOL in the last KAMPYLOS_NM_STALL_ITERS iterations, and restart again only
++// after a restart that gained more than KAMPYLOS_RESTART_MIN_GAIN. All 0 = the apps' behaviour;
++// set them with -D. The GPU checkpoint gains the stall state (format 3).
++#ifndef KAMPYLOS_NM_STALL_ITERS
++#define KAMPYLOS_NM_STALL_ITERS 0
++#endif
++#ifndef KAMPYLOS_NM_STALL_TOL
++#define KAMPYLOS_NM_STALL_TOL 0.0
++#endif
++#ifndef KAMPYLOS_RESTART_MIN_GAIN
++#define KAMPYLOS_RESTART_MIN_GAIN 0.0
++#endif
++
+ struct BinaryFitResult {
+     // log_s/log_q: as passed in (natural log) by the fit functions below; the work-unit driver
+     // overwrites them with the cell's GRID coordinates before writing the result line.
+@@ -63,7 +75,7 @@ inline BinaryFitResult fit_binary_local_steps(
+         return linear_flux_fit(data, mag, fs_bound).chi2;
+     };
+ 
+-    SimplexResult res = nelder_mead(objective, x0, step, max_iter, 1e-9, 1e-8);
++    SimplexResult res = nelder_mead(objective, x0, step, max_iter, 1e-9, 1e-8, KAMPYLOS_NM_STALL_ITERS, KAMPYLOS_NM_STALL_TOL);
+     // Nelder-Mead's own convergence test (simplex has shrunk enough) can fire while still
+     // sitting in a shallow local trap, especially near a caustic where the chi2 surface has
+     // real structure on scales smaller than the initial step size. Restarting once from the
+@@ -71,8 +83,10 @@ inline BinaryFitResult fit_binary_local_steps(
+     // kind of premature convergence without needing a different algorithm.
+     for (int restart = 0; restart < n_restarts; restart++) {
+         std::vector<double> step2 = { 0.3, 0.02, 0.08, 0.15, 0.2 };
+-        SimplexResult res2 = nelder_mead(objective, res.x, step2, max_iter, 1e-10, 1e-9);
+-        if (res2.fval < res.fval) res = res2; else break;
++        SimplexResult res2 = nelder_mead(objective, res.x, step2, max_iter, 1e-10, 1e-9, KAMPYLOS_NM_STALL_ITERS, KAMPYLOS_NM_STALL_TOL);
++        bool again = res2.fval < res.fval - KAMPYLOS_RESTART_MIN_GAIN;
++        if (res2.fval < res.fval) res = res2;
++        if (!again) break;
+     }
+ 
+     BinaryFitResult out;
+diff --git a/src/kampylos_batched_fit.h b/src/kampylos_batched_fit.h
+index 0a610b5..729c2a5 100644
+--- a/src/kampylos_batched_fit.h
++++ b/src/kampylos_batched_fit.h
+@@ -107,7 +107,7 @@ inline bool get(std::istringstream& i, std::vector<std::vector<double>>& v) {
+ inline std::string kampylos_batched_state_to_text(const KampylosBatchedState& s) {
+     using namespace kampylos_batched_detail;
+     std::ostringstream o;
+-    o << "kampylos_batched_fit 2\n";
++    o << "kampylos_batched_fit 3\n";
+     o << s.cell << ' ' << s.n_seeds << ' ' << s.n_restarts << ' ' << s.phase << ' ' << s.round << '\n';
+     o << s.current.size();
+     for (const auto& r : s.current) { o << ' ' << (r.converged ? 1 : 0) << ' ' << r.iterations; put(o, r.fval); put(o, r.x); }
+@@ -122,6 +122,7 @@ inline std::string kampylos_batched_state_to_text(const KampylosBatchedState& s)
+         put(o, t.ftol); put(o, t.xtol); put(o, t.fr);
+         put(o, t.simplex); put(o, t.pending); put(o, t.fval);
+         put(o, t.centroid); put(o, t.worst); put(o, t.xr); put(o, t.xe); put(o, t.xc);
++        o << ' ' << t.stall_iters << ' ' << t.stall_iter; put(o, t.stall_tol); put(o, t.stall_f);
+         o << '\n';
+     }
+     o << "partial"; put(o, s.partial); o << '\n';
+@@ -133,7 +134,7 @@ inline bool kampylos_batched_state_from_text(const std::string& text, KampylosBa
+     using namespace kampylos_batched_detail;
+     std::istringstream i(text);
+     std::string tag; int version;
+-    if (!(i >> tag >> version) || tag != "kampylos_batched_fit" || (version != 1 && version != 2)) return false;
++    if (!(i >> tag >> version) || tag != "kampylos_batched_fit" || (version < 1 || version > 3)) return false;
+     KampylosBatchedState t;
+     if (!(i >> t.cell >> t.n_seeds >> t.n_restarts >> t.phase >> t.round)) return false;
+     size_t n;
+@@ -160,6 +161,7 @@ inline bool kampylos_batched_state_from_text(const std::string& text, KampylosBa
+         if (!get(i, st.ftol) || !get(i, st.xtol) || !get(i, st.fr)) return false;
+         if (!get(i, st.simplex) || !get(i, st.pending) || !get(i, st.fval)) return false;
+         if (!get(i, st.centroid) || !get(i, st.worst) || !get(i, st.xr) || !get(i, st.xe) || !get(i, st.xc)) return false;
++        if (version >= 3 && (!(i >> st.stall_iters >> st.stall_iter) || !get(i, st.stall_tol) || !get(i, st.stall_f))) return false;
+         if (st.n < 1 || st.n > 32 || (int)st.simplex.size() != st.n + 1 || (int)st.fval.size() != st.n + 1) return false;
+         t.steppers.emplace_back(st);
+     }
+@@ -311,7 +313,7 @@ BinaryFitResult kampylos_batched_fit_seeds(Eval& eval, double ln_s, double ln_q,
+         s.cell = cell; s.n_seeds = n; s.n_restarts = n_restarts; s.phase = 0;
+         s.active.assign(n, 1);
+         s.steppers.reserve(n);
+-        for (int i = 0; i < n; i++) { s.steppers.emplace_back(seeds.x0[i], seeds.step[i], 400, 1e-9, 1e-8); s.idx.push_back(i); }
++        for (int i = 0; i < n; i++) { s.steppers.emplace_back(seeds.x0[i], seeds.step[i], 400, 1e-9, 1e-8, KAMPYLOS_NM_STALL_ITERS, KAMPYLOS_NM_STALL_TOL); s.idx.push_back(i); }
+     }
+     if (completed) *completed = true;
+ 
+@@ -330,8 +332,8 @@ BinaryFitResult kampylos_batched_fit_seeds(Eval& eval, double ln_s, double ln_q,
+         } else {
+             for (size_t k = 0; k < s.idx.size(); k++) {
+                 int i = s.idx[k];
++                if (!(res[k].fval < s.current[i].fval - KAMPYLOS_RESTART_MIN_GAIN)) s.active[i] = 0;
+                 if (res[k].fval < s.current[i].fval) s.current[i] = res[k];
+-                else s.active[i] = 0;
+             }
+         }
+         if (s.phase >= s.n_restarts) break;
+@@ -341,7 +343,7 @@ BinaryFitResult kampylos_batched_fit_seeds(Eval& eval, double ln_s, double ln_q,
+         for (int i = 0; i < n; i++) {
+             if (!s.active[i]) continue;
+             s.idx.push_back(i);
+-            s.steppers.emplace_back(s.current[i].x, std::vector<double>{ 0.3, 0.02, 0.08, 0.15, 0.2 }, 400, 1e-10, 1e-9);
++            s.steppers.emplace_back(s.current[i].x, std::vector<double>{ 0.3, 0.02, 0.08, 0.15, 0.2 }, 400, 1e-10, 1e-9, KAMPYLOS_NM_STALL_ITERS, KAMPYLOS_NM_STALL_TOL);
+         }
+         if (s.idx.empty()) break;
+     }
+diff --git a/src/nelder_mead_stepper.h b/src/nelder_mead_stepper.h
+index 92b4fa4..d8064bc 100644
+--- a/src/nelder_mead_stepper.h
++++ b/src/nelder_mead_stepper.h
+@@ -32,9 +32,11 @@ struct SimplexResultLite {
+ 
+ class NelderMeadStepper {
+ public:
+-    NelderMeadStepper(std::vector<double> x0, std::vector<double> step, int max_iter = 2000, double ftol = 1e-10, double xtol = 1e-10)
++    NelderMeadStepper(std::vector<double> x0, std::vector<double> step, int max_iter = 2000, double ftol = 1e-10, double xtol = 1e-10,
++                      int stall_iters = 0, double stall_tol = 0.0)
+         : n((int)x0.size()), n1((int)x0.size() + 1), max_iter(max_iter), ftol(ftol), xtol(xtol),
+-          simplex(n1, x0), fval(n1, 0.0), phase(NMPhase::NeedInit), iter(0), converged(false)
++          simplex(n1, x0), fval(n1, 0.0), phase(NMPhase::NeedInit), iter(0), converged(false),
++          stall_iters(stall_iters), stall_tol(stall_tol)
+     {
+         for (int i = 0; i < n; i++) simplex[i + 1][i] += step[i];
+         pending = simplex; // NeedInit: caller must evaluate all n1 vertices, in simplex order
+@@ -45,6 +47,8 @@ public:
+         int n = 0, max_iter = 0, iter = 0, phase = 0;
+         double ftol = 0, xtol = 0, fr = 0;
+         bool converged = false;
++        int stall_iters = 0, stall_iter = 0;         // simplex.h's stall test (0 = off)
++        double stall_tol = 0, stall_f = 1e300;
+         std::vector<std::vector<double>> simplex, pending;
+         std::vector<double> fval, centroid, worst, xr, xe, xc;
+     };
+@@ -52,6 +56,7 @@ public:
+         State s;
+         s.n = n; s.max_iter = max_iter; s.iter = iter; s.phase = (int)phase;
+         s.ftol = ftol; s.xtol = xtol; s.fr = fr; s.converged = converged;
++        s.stall_iters = stall_iters; s.stall_iter = stall_iter; s.stall_tol = stall_tol; s.stall_f = stall_f;
+         s.simplex = simplex; s.pending = pending; s.fval = fval;
+         s.centroid = centroid; s.worst = worst; s.xr = xr; s.xe = xe; s.xc = xc;
+         return s;
+@@ -59,7 +64,8 @@ public:
+     explicit NelderMeadStepper(const State& s)
+         : n(s.n), n1(s.n + 1), max_iter(s.max_iter), ftol(s.ftol), xtol(s.xtol),
+           simplex(s.simplex), fval(s.fval), pending(s.pending), phase((NMPhase)s.phase), iter(s.iter), converged(s.converged),
+-          centroid(s.centroid), worst(s.worst), xr(s.xr), xe(s.xe), xc(s.xc), fr(s.fr) {}
++          centroid(s.centroid), worst(s.worst), xr(s.xr), xe(s.xe), xc(s.xc), fr(s.fr),
++          stall_iters(s.stall_iters), stall_iter(s.stall_iter), stall_tol(s.stall_tol), stall_f(s.stall_f) {}
+ 
+     bool done() const { return phase == NMPhase::Done; }
+     int iterations() const { return iter; }
+@@ -143,6 +149,8 @@ private:
+ 
+     std::vector<double> centroid, worst, xr, xe, xc;
+     double fr = 0;
++    int stall_iters = 0, stall_iter = 0;
++    double stall_tol = 0, stall_f = 1e300;
+ 
+     // Sorts the simplex, checks convergence, and either finishes (phase=Done) or sets up the
+     // next iteration's reflection point request (phase=NeedReflect) -- the one piece of logic
+@@ -167,6 +175,10 @@ private:
+             xspread = std::max(xspread, std::sqrt(d));
+         }
+         if (fspread < ftol && xspread < xtol) { converged = true; phase = NMPhase::Done; return; }
++        if (stall_iters > 0) {
++            if (fval[0] < stall_f - stall_tol) { stall_f = fval[0]; stall_iter = iter; }
++            else if (iter - stall_iter >= stall_iters) { phase = NMPhase::Done; return; }
++        }
+ 
+         centroid.assign(n, 0.0);
+         for (int i = 0; i < n; i++) for (int j = 0; j < n; j++) centroid[j] += simplex[i][j];
+diff --git a/src/simplex.h b/src/simplex.h
+index 58b9d57..e734623 100644
+--- a/src/simplex.h
++++ b/src/simplex.h
+@@ -18,13 +18,17 @@ struct SimplexResult {
+ // f: objective to minimize. x0: starting point. step: initial per-dimension step size (the
+ // simplex's first edge length along each axis). max_iter: safety cap. ftol/xtol: convergence
+ // thresholds on function-value spread and vertex spread across the simplex.
++// stall_iters/stall_tol (0 = off): also stop when the best value has not improved by more than
++// stall_tol in the last stall_iters iterations (see binary_fit.h; converged stays false).
+ inline SimplexResult nelder_mead(
+     const std::function<double(const std::vector<double>&)>& f,
+     std::vector<double> x0,
+     std::vector<double> step,
+     int max_iter = 2000,
+     double ftol = 1e-10,
+-    double xtol = 1e-10
++    double xtol = 1e-10,
++    int stall_iters = 0,
++    double stall_tol = 0.0
+ ) {
+     int n = (int)x0.size();
+     int n1 = n + 1;
+@@ -38,6 +42,8 @@ inline SimplexResult nelder_mead(
+ 
+     int iter = 0;
+     bool converged = false;
++    double stall_f = 1e300;
++    int stall_iter = 0;
+     for (; iter < max_iter; iter++) {
+         std::vector<int> order(n1);
+         for (int i = 0; i < n1; i++) order[i] = i;
+@@ -55,6 +61,10 @@ inline SimplexResult nelder_mead(
+             xspread = std::max(xspread, std::sqrt(d));
+         }
+         if (fspread < ftol && xspread < xtol) { converged = true; break; }
++        if (stall_iters > 0) {
++            if (fval[0] < stall_f - stall_tol) { stall_f = fval[0]; stall_iter = iter; }
++            else if (iter - stall_iter >= stall_iters) break;
++        }
+ 
+         std::vector<double> centroid(n, 0.0);
+         for (int i = 0; i < n; i++) {

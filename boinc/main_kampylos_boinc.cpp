@@ -33,6 +33,7 @@
 // instead of patching vendored third-party source to dodge windows.h's namespace pollution.
 #include "../src/kampylos_wu.h"
 #include "../src/kampylos_cpu_cell.h"
+#include "../src/kampylos_cpu_seed_pool.h"
 
 #include "kampylos_boinc_common.h"
 
@@ -59,6 +60,21 @@ int main(int argc, char **argv) {
         fprintf(stderr, "boinc_init_options failed: %d\n", rc);
         return rc;
     }
+    // 2026-11-05 (KAM-040): a task the client budgets more than one CPU for (an `mt` plan class,
+    // avg_ncpus = N) fits the seeds of a cell on N threads, with the result of one thread
+    // (src/kampylos_cpu_seed_pool.h). Today's plan class gives 1 CPU: one thread, as before. Builds without
+    // history-free evaluations or without the thread-safe library keep one thread whatever the budget.
+    KampylosSeedPool* pool = nullptr;   // never deleted: its threads must not exit (KAM-010)
+    APP_INIT_DATA aid;
+    if (boinc_get_init_data(aid) == 0) {
+        int n = std::min(kampylos_boinc_cpu_threads(aid), std::max(1, (int)std::thread::hardware_concurrency()));
+        if (n > 1 && kampylos_cpu_seed_threads_allowed()) {
+            pool = new KampylosSeedPool(n);
+            kampylos_boinc_install_worker_pause();   // the seed threads wait while the task is suspended (KAM-027)
+        }
+        fprintf(stderr, "seed threads: %d (client budget %.2f CPUs%s)\n", pool ? n : 1, aid.ncpus,
+                n > 1 && !pool ? "; this build fits one seed at a time, see src/kampylos_cpu_seed_pool.h" : "");
+    }
 
     KampylosBoincJob job;
     if (kampylos_boinc_load_inputs(job, true)) { boinc_finish(1); return 1; }
@@ -70,7 +86,7 @@ int main(int argc, char **argv) {
     return kampylos_boinc_run(job, vbm, [&](double ln_s, double ln_q, const BinarySeedSet &seeds) {
         KampylosCellHooks hooks = kampylos_boinc_cell_hooks(cell, job.total);
         BinaryFitResult best = kampylos_fit_cell_resumable(vbm, job.data, ln_s, ln_q, seeds, cell,
-                                                           job.in.part, job.in.nparts, hooks, stderr);
+                                                           job.in.part, job.in.nparts, hooks, stderr, nullptr, pool);
         cell++;
         return best;
     });

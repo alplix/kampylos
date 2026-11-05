@@ -4,7 +4,9 @@
 // the period comes from KAMPYLOS_STUB_CHECKPOINT_SECONDS (default 60, 0 = every call), so a
 // resume test can make the app checkpoint after every seed. KAMPYLOS_STUB_NCPUS (default 1)
 // is the CPU budget boinc_get_init_data() reports, e.g. 0.1 to run a GPU wrapper the way the
-// client runs it under the metal_apple_gpu plan class.
+// client runs it under the metal_apple_gpu plan class. boinc_get_status() reports the task as suspended while
+// the file named by KAMPYLOS_STUB_SUSPEND_FILE exists (to test that helper threads pause, KAM-027); the stub
+// never stops the main thread itself.
 #include "boinc_api.h"
 #include "filesys.h"
 #include <cstdio>
@@ -46,6 +48,13 @@ int boinc_resolve_filename(const char* virtual_name, char* physical_name, int le
 int boinc_get_init_data(APP_INIT_DATA& d) {
     d = APP_INIT_DATA();
     if (const char* p = getenv("KAMPYLOS_STUB_NCPUS")) d.ncpus = atof(p);
+    return 0;
+}
+
+int boinc_get_status(BOINC_STATUS* s) {
+    *s = BOINC_STATUS();
+    const char* p = getenv("KAMPYLOS_STUB_SUSPEND_FILE");
+    if (p && *p) { FILE* f = fopen(p, "r"); if (f) { s->suspended = 1; fclose(f); } }
     return 0;
 }
 

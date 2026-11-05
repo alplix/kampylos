@@ -29,7 +29,10 @@
 #include <string>
 #include <vector>
 #include <algorithm>
+#include <chrono>
+#include <thread>
 #include "../src/kampylos_cpu_cell.h"   // seed checkpoint format (Kampylos headers first, see above)
+#include "../src/kampylos_pause.h"      // kampylos_worker_pause_fn() (KAM-027)
 #include "../src/kampylos_batched_fit.h" // KampylosBatchedHooks (GPU apps' in-cell checkpoint)
 #include "boinc_api.h"
 #include "filesys.h"
@@ -272,6 +275,20 @@ inline KampylosBatchedHooks kampylos_boinc_batched_hooks(int cell, int total) {
     h.keep_going = nullptr;
     return h;
 }
+
+// KAM-027 (2026-11-05): while the client has the task suspended, the threads the app created wait between two
+// pieces of work (src/kampylos_pause.h); the BOINC runtime stops only the main thread. Every wrapper installs
+// this right after boinc_init_options(). Polls the status the runtime keeps (boinc_get_status) every 0.2 s;
+// a quit or abort request ends the wait, and the runtime then ends the process.
+static void kampylos_boinc_worker_pause() {
+    BOINC_STATUS st;
+    boinc_get_status(&st);
+    while (st.suspended && !st.quit_request && !st.abort_request) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        boinc_get_status(&st);
+    }
+}
+inline void kampylos_boinc_install_worker_pause() { kampylos_worker_pause_fn() = &kampylos_boinc_worker_pause; }
 
 // CPU threads for the GPU apps' completion step (src/kampylos_cpu_patch_pool.h): the whole
 // number of CPUs the client budgeted for this task -- init_data's ncpus, which is the app

@@ -49,3 +49,4 @@ short `TdrDelay` shows the failure.
 ## Log
 
 - 2026-10-27: recorded from the 2026-10-21 audit, verified at 45a41d5 by reading.
+- 2026-11-05: 2026-11-05: the opt-in round split of KAM-035 (KAMPYLOS_CUDA_PIPELINE / KAMPYLOS_OPENCL_PIPELINE) also caps a launch at 4e6 candidate x point evaluations, the Metal app's budget (0.5 s on a base M1 GPU); the time budget on CUDA/OpenCL GPUs is unmeasured

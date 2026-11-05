@@ -2,11 +2,11 @@
 id: KAM-027
 title: The GPU apps' completion-pool threads keep running after the task is suspended, until their share of the current batch is done
 type: bug
-status: confirmed
+status: fix-proposed
 severity: low
 platforms: [cuda, opencl, metal]
 area: boinc-lifecycle
-next: In KampylosCpuPatchPool, block SIGALRM in worker_loop() and let run_share() wait between candidates while the task is suspended (callback)
+next: Check with a real BOINC client on Linux and Windows that a suspended GPU task (and a threaded CPU task) stops using CPU within a second; the stub test is in docs/BENCHMARK.md (2026-11-05)
 pattern: PAT-025
 aliases: []
 reported: 2026-10-27
@@ -57,11 +57,20 @@ Verified by reading at 45a41d5 and the BOINC source at 4d1529d; not run under a 
 
 ## Fix
 
-Not written yet. Two small changes: block SIGALRM in the pool threads (`pthread_sigmask` at the start of
+The review proposed two small changes: block SIGALRM in the pool threads (`pthread_sigmask` at the start of
 `worker_loop`, not on Windows); and let `run_share()` check `boinc_get_status()` (`suspended`) between candidates
 and wait while it is set, so a suspend stops the pool within one candidate (the pool header has no BOINC dependency
 today; pass a callback in). `boinc_init_parallel()` would suspend the whole process, but on Unix it forks the
 application and was not checked against the GPU code.
+
+Proposed on 2026-11-05 (`src/kampylos_pause.h`, `src/kampylos_cpu_patch_pool.h`, `boinc/kampylos_boinc_common.h`): the
+pool threads block SIGALRM, so BOINC's timer signal reaches the main thread, and call `kampylos_worker_pause()` before
+each candidate; every BOINC wrapper points it at a wait that polls `boinc_get_status()` every 0.2 s while the task is
+suspended (a quit or abort request ends the wait). The threaded CPU app's seed threads use the same pause before each
+objective evaluation. It only delays work, so no result can change. Measured with the stub, which reports the task
+suspended while a file exists (`KAMPYLOS_STUB_SUSPEND_FILE`), 4 threads, planet cell, Apple M4 Pro: the threaded CPU app
+used 0.05 s of CPU in 10 s of suspension and 19.5 s in the 5 s after it, the Metal app 0.03 s and 13 s. The stub never
+stops the main thread, so the branch tip cannot be compared this way; the real client was not used.
 
 ## Test
 
@@ -72,3 +81,4 @@ watch the per-thread CPU use (`top -H`, Process Explorer); it must drop to about
 ## Log
 
 - 2026-10-27: recorded as the origin of PAT-025; verified at 45a41d5 and against BOINC 4d1529d by reading.
+- 2026-11-05: 2026-11-05: pool threads block SIGALRM and pause between candidates while suspended (src/kampylos_pause.h); stub test: 0.03-0.05 s of CPU in 10 s suspended

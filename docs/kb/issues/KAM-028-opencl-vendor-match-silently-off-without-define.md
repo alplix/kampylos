@@ -35,7 +35,7 @@ Verified by reading at 45a41d5:
   outside this repository.
 * The log line of `opencl_fit_select_device()` names the device (`:92`) but not the expected vendor.
 * The release process has dropped `-D` flags before: the macOS CPU binary shipped as version 12 printed "v4" and the
-  Metal binary shipped as version 2 printed "v1" (kampylos-report-2026-10-16.html §3), that is, they were built without
+  Metal binary shipped as version 2 printed "v1" (docs/BENCHMARK.md "Measurements of 2026-10-16" §3), that is, they were built without
   `-DKAMPYLOS_VERSION` / `-DKAMPYLOS_METAL_VERSION`. That one only affects the version in stderr.
 
 The other guards in `src/` and `boinc/` were checked and are harmless or loud: the version defaults (cosmetic),
