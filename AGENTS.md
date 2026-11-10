@@ -17,7 +17,11 @@ diagnostics are recomputed on the host, and one 16-field line is appended to `ou
 (`# grid=...` and `# anchor format=2 backend=...`, see README.md). With `part i K` the task fits only the seeds
 k with k % K == i; the server keeps the lowest chi2 per cell over the K parts. A cell takes minutes on an ordinary
 event and days on an event whose single-lens anchor has no baseline (measurements in
-`docs/BENCHMARK.md`, "Measurements of 2026-10-16"); one task is one cell or a short row of cells.
+`docs/BENCHMARK.md`, "Measurements of 2026-10-16"); one task is one cell or a short row of cells. Every CPU work unit
+carries the same `rsc_fpops_est` (3e13) and `rsc_fpops_bound` (1.2e15, 40x), so the client aborts the slow ones at its
+elapsed time limit, exit status 197, on every host (KAM-041, pattern PAT-034; seen 2026-11-08 on events whose anchor
+ends at tE = 3000 d). The "Crashed executable" (macOS) or "Breakpoint Encountered" (Windows) trace after such an abort
+is the BOINC library's reaction to it, not a crash.
 
 ## Layout
 
@@ -223,7 +227,7 @@ clang++ -O2 -std=c++17 -fobjc-arc -I src -I $VBM -I <boinc>/api -I <boinc>/lib \
 ## Not in this repository
 
 - The server side: `kampylos_assimilate.sh`, `kampylos_validate.sh`, `kampylos_analyze.py` (the regression suite
-  calls it), the work-unit generator, plan classes (`avg_ncpus` sets the GPU apps' completion threads), the web page
+  calls it), the work-unit generator (it sets `rsc_fpops_est` and `rsc_fpops_bound`, KAM-041), plan classes (`avg_ncpus` sets the GPU apps' completion threads), the web page
   that calls `model_curve_cli`. They live in the parent `bitboinc` repository, which vendors this one at
   `vendor/kampylos` (paths in comments use that prefix).
 - `cl_dynload.{c,h}`, the OpenCL loader the OpenCL build links (`src/kampylos_opencl_fit.h` includes it). It is a copy

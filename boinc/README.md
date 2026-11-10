@@ -107,6 +107,17 @@ On a restart the app resumes from `min(kampylos_checkpoint, complete lines in ou
 authoritative record of finished cells, so a missing or stale checkpoint file never costs a finished cell. Inside a
 cell both the CPU and the GPU apps resume bit-identically, and report progress after every seed / every round.
 
+## Elapsed time limit
+
+The client aborts a task whose elapsed time passes `rsc_fpops_bound` divided by the speed the scheduler learned from
+the host's valid tasks, with exit status 197 ("exceeded elapsed time limit"). A restart keeps the elapsed time, so
+checkpoints do not help, and nothing in the app can raise the limit: the work units must carry a bound that covers
+their slowest cell. With one estimate for every CPU work unit (3e13, bound 1.2e15 in November 2026) the limit is 40
+average tasks of the host, and the tasks of events whose single-lens anchor ends at the tE bound of 3000 d cost more:
+on 2026-11-08 they failed on macOS (arm64, x86_64) and Windows alike (KAM-041, shared pattern PAT-034). After such an
+abort the stderr shows the BOINC library's trace ("Crashed executable name" on macOS, "Breakpoint Encountered" and a
+debugger dump on Windows), not a crash of the app.
+
 ## Tests
 
 - `tests/test_cpu_resume.cpp` -- the resumable seed loop and the result-file helpers (seconds).

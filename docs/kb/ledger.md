@@ -44,3 +44,4 @@ When code that a row describes changes a lot, check the pattern again and update
 | PAT-031 | affected | 2026-11-04 | faba573 | KAM-033 | VBMicrolensing's 577 thread_local statics (fork); --strip/--block build options |
 | PAT-032 | affected | 2026-11-04 | faba573 | KAM-034, KAM-036 | VBMicrolensing new/delete per magnification; jemalloc build line |
 | PAT-033 | affected | 2026-11-04 | faba573 | KAM-035 | CUDA and OpenCL wait before completing a round; Metal overlaps since this branch |
+| PAT-034 | affected | 2026-11-10 | 2b01b38 | KAM-041 | every cpu work unit gets rsc_fpops_est 3e13 and rsc_fpops_bound 1.2e15 (40x) from the work generator (not here); tasks of events whose anchor ends at tE = 3000 d cost more (KAM-041, task 8838769) |

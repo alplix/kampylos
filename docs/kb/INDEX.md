@@ -1,6 +1,6 @@
 # kampylos: knowledge base index
 
-40 issues: 28 open (15 fix, 7 decide, 1 verify, 5 review), 8 note(s), 4 closed. Shared patterns here: 18 affected, 2 fixed, 13 clear, 0 unchecked.
+42 issues: 30 open (15 fix, 8 decide, 2 verify, 5 review), 8 note(s), 4 closed. Shared patterns here: 19 affected, 2 fixed, 13 clear, 0 unchecked.
 
 Work from the top: pick an issue, read its file, and its pattern's "How to fix" if it has one. Coding
 agents: `python3 docs/kb/shared/kb.py list --open --action fix` prints the same, one line per issue, and
@@ -29,12 +29,13 @@ The cause is known and the fix is clear. Highest severity first.
 | [KAM-026] | low | science | fit_event ignores the seed-split token "part i K" and fits every seed | In src/fit_event.cpp, pass kampylos_seed_part(seeds, in.part, in.nparts) to every backend's fit_cell |
 | [KAM-031] | low | determinism | Mac builds' result lines depend on the Xcode version: Apple clang 21 fuses multiply-adds, Apple clang 14 did not | Add -ffp-contract=off to the macOS build lines if KAM-025's answer is that results of different builds are compared [PAT-018] |
 
-## Waiting for a maintainer decision (7)
+## Waiting for a maintainer decision (8)
 
 Questions for the maintainers, and issues whose fix depends on an answer.
 
 | ID | Sev | Area | Problem | Next step |
 |---|---|---|---|---|
+| [KAM-041] | high | boinc-lifecycle | CPU tasks of events whose single-lens anchor runs to tE = 3000 d end at the client's elapsed time limit | Decide (maintainers, work generator): a CPU bound far above 40x the estimate, an estimate per event (points, anchor at the tE bound), or such events on GPU, mt or more seed parts [PAT-034] |
 | [KAM-002] | med | gpu-runtime | CUDA and OpenCL end the task as a computation error on GPU errors; only Metal exits temporarily | Decide whether CUDA and OpenCL GPU errors may end in boinc_temporary_exit() with a retry cap of about 5, as Metal does, instead of a computation error [PAT-013] |
 | [KAM-016] | low | docs | README.md names a MUSA GPU backend that has no code in this repository | Decide where the MUSA build comes from and document it, or remove MUSA from README.md line 24 |
 | [KAM-021] | low | determinism | Is a rounding-level difference after a GPU resume acceptable, and should the resume test compare numerically? | Decide whether a rounding-level difference after a GPU resume with several completion threads is acceptable, and the resume test may compare numerically |
@@ -43,13 +44,14 @@ Questions for the maintainers, and issues whose fix depends on an answer.
 | [KAM-037] | info | science | Decide the Nelder-Mead stopping rules: about 2x less CPU on whole cells with the same chi2 once evaluations are history-free | Decide (maintainers) on nm-stopping.patch's rules (restart after a gain > 1e-3, stop after 100 iterations without 1e-4), after the regression suite's real events |
 | [KAM-040] | info | performance | CPU app: should an mt plan class run the seeds of a cell on several threads? | Decide (maintainers) whether to offer a threaded CPU app version (mt plan class, avg_ncpus N): same result lines, tasks 1.9-6.5x shorter at 2-8 threads for 3-10 % more CPU (blocked by [KAM-030]) |
 
-## Verify first (1)
+## Verify first (2)
 
 Reported or suspected but not confirmed: reproduce or measure before fixing.
 
 | ID | Sev | Area | Problem | Next step |
 |---|---|---|---|---|
 | [KAM-029] | med | build | No CUDA architecture list or minimum compute capability is recorded; the only gencode in the repository is sm_120 | Run cuobjdump --list-elf --list-ptx on each shipped CUDA binary and compare with the plan class's minimum compute capability [PAT-024] |
+| [KAM-042] | low | boinc-lifecycle | A Windows CPU task ended with exit code 194 (EXIT_ABORTED_BY_CLIENT) that the client had not asked for | Look at the host's event log around the end of task 8830679 and at the other tasks of its work unit; count exit-194 errors of other apps on Windows hosts |
 
 ## Fix written, not merged yet (5)
 
@@ -89,7 +91,7 @@ Gotchas and design notes: nothing to fix, but they explain why the code is the w
 
 Bug classes found in any bitboinc application ([shared/patterns](shared/patterns)). The issues above name the pattern they are an instance of; the evidence for every verdict is in [ledger.md](ledger.md).
 
-- Affected: [PAT-003], [PAT-005], [PAT-006], [PAT-007], [PAT-010], [PAT-012], [PAT-013], [PAT-014], [PAT-015], [PAT-016], [PAT-018], [PAT-019], [PAT-024], [PAT-025], [PAT-028], [PAT-031], [PAT-032], [PAT-033]
+- Affected: [PAT-003], [PAT-005], [PAT-006], [PAT-007], [PAT-010], [PAT-012], [PAT-013], [PAT-014], [PAT-015], [PAT-016], [PAT-018], [PAT-019], [PAT-024], [PAT-025], [PAT-028], [PAT-031], [PAT-032], [PAT-033], [PAT-034]
 - Fixed here: [PAT-011], [PAT-020]
 - Unchecked: none
 - Checked and clear (not affected, or not applicable): PAT-001, PAT-002, PAT-004, PAT-008, PAT-009, PAT-017, PAT-021, PAT-022, PAT-023, PAT-026, PAT-027, PAT-029, PAT-030
@@ -98,13 +100,14 @@ Bug classes found in any bitboinc application ([shared/patterns](shared/patterns
 
 Issues tagged `all` are not repeated here.
 
-- windows: KAM-011, KAM-023, KAM-029
+- windows: KAM-011, KAM-023, KAM-029, KAM-042
 - macos: KAM-024, KAM-031
 - linux: KAM-029
 - cuda: KAM-002, KAM-011, KAM-018, KAM-021, KAM-027, KAM-029, KAM-032, KAM-035
 - opencl: KAM-002, KAM-005, KAM-006, KAM-011, KAM-018, KAM-021, KAM-022, KAM-027, KAM-028, KAM-032, KAM-035
 - metal: KAM-018, KAM-021, KAM-024, KAM-027, KAM-032
 - clang: KAM-031
+- boinc-client: KAM-042
 
 [KAM-001]: issues/KAM-001-out-open-failure-truncates-output.md
 [KAM-002]: issues/KAM-002-cuda-opencl-gpu-errors-end-task.md
@@ -146,6 +149,8 @@ Issues tagged `all` are not repeated here.
 [KAM-038]: issues/KAM-038-background-qos-would-put-the-app-on-the-mac-s-efficiency-cor.md
 [KAM-039]: issues/KAM-039-a-cell-s-best-fit-can-be-reported-in-either-mirror-form-u0-a.md
 [KAM-040]: issues/KAM-040-cpu-app-should-an-mt-plan-class-run-the-seeds-of-a-cell-on-s.md
+[KAM-041]: issues/KAM-041-cpu-tasks-of-events-whose-single-lens-anchor-runs-to-te-3000.md
+[KAM-042]: issues/KAM-042-a-windows-cpu-task-ended-with-exit-code-194-exit-aborted-by.md
 [PAT-003]: shared/patterns/PAT-003-checkpoint-not-written-atomically.md
 [PAT-005]: shared/patterns/PAT-005-open-failure-treated-as-fresh-start.md
 [PAT-006]: shared/patterns/PAT-006-write-errors-unchecked-before-finish.md
@@ -166,3 +171,4 @@ Issues tagged `all` are not repeated here.
 [PAT-031]: shared/patterns/PAT-031-thread-local-in-hot-code-costs-a-function-call-per-access-on.md
 [PAT-032]: shared/patterns/PAT-032-small-allocations-in-a-hot-loop-are-slow-with-the-macos-syst.md
 [PAT-033]: shared/patterns/PAT-033-a-gpu-app-waits-for-each-launch-before-its-host-work-so-gpu.md
+[PAT-034]: shared/patterns/PAT-034-a-fixed-rsc-fpops-bound-makes-the-client-abort-every-task-wh.md
