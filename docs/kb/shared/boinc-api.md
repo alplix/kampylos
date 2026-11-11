@@ -97,3 +97,37 @@ version, correct it here, date the correction, and sync.
   The library's own helper `boinc_get_opencl_ids()` (`api/boinc_opencl.cpp:80-110`, `168-300`) does exactly that
   lookup; an application that enumerates devices itself must use the same platform and the same device type
   (pattern PAT-012).
+
+## Resource limits and aborts
+
+Added 2026-11-10, read at github.com/BOINC/boinc commit `fc12d39` (2026-11-04); the line numbers in this section
+refer to that commit.
+
+* **Elapsed time limit.** When a task starts, the client sets its limit to `rsc_fpops_bound / flops`, where `flops` is
+  the speed the scheduler last sent for this app version on this host (`client/app.cpp:286`; a limit under 120 s
+  becomes 12 h, `287-293`). On every poll a CPU-intensive task whose elapsed time is over it is aborted with exit
+  status 197 (`EXIT_TIME_LIMIT_EXCEEDED`) and the message "exceeded elapsed time limit L (boundG/flopsG)"
+  (`client/app_control.cpp:877-890`); non-CPU-intensive and sporadic apps are exempt (`always_run()`,
+  `client/app.h:208-210`). A restart continues the elapsed time of the last checkpoint (`client/app_start.cpp:671`),
+  so neither a restart nor a checkpoint helps a task past it.
+* **The `flops` in that limit follows the host's own valid tasks.** With more than 10 validated tasks of the app
+  version on the host, the scheduler's `flops` is 1 / (the average of elapsed time / `rsc_fpops_est`) over them
+  (`sched/sched_version.cpp:369-400`, `MIN_HOST_SAMPLES` in `sched/credit.h:25`); the average is updated only by the
+  validator's credit step and leaves out runtime outliers (`sched/credit.cpp:771-791`). Tasks that end in an error
+  never enter it. **Consequence:** when every work unit carries the same `rsc_fpops_est`, the limit is
+  `rsc_fpops_bound / rsc_fpops_est` times the host's average task, whatever the host's speed, and a work unit that
+  costs more than that many average tasks is aborted on every host it is sent to. Pattern PAT-034.
+* **`rsc_memory_bound` is not enforced:** the check is compiled out (`#if 0`, `client/app_control.cpp:892-910`). Only a
+  resident set above the client's RAM limit aborts a task (`EXIT_MEM_LIMIT_EXCEEDED`, `912-924`).
+* **An abort looks like a crash in stderr.** On an abort message the library calls `DebugBreak()` on Windows and
+  `PrintBacktrace()` on macOS before it exits (`api/boinc_api.cpp:1336-1349`). A Windows stderr then ends with
+  "Unhandled Exception Detected ... Breakpoint Encountered (0x80000003)" and a "BOINC Windows Runtime Debugger" dump,
+  a macOS one with "Crashed executable name: ..." and an `atos` line. Neither is a fault of the application; the
+  message of the result (the client's reason, e.g. "exceeded elapsed time limit") says why it was aborted.
+* **Exit code 194 (`EXIT_ABORTED_BY_CLIENT`)** is what the library exits with after an abort message
+  (`api/boinc_api.cpp:1348`, or at the end of a critical section, `1703-1704`), and on Windows the code the client
+  terminates a process with when an abort request is not obeyed within 60 s and when it cleans up the recorded
+  descendants and other processes of a task that has exited (`client/app_control.cpp:99-108`, `236-239`, `284-292`).
+  When the client asked for the abort it ignores the exit code and reports its own reason (`454-455`, `963-972`). On
+  Windows, a result whose message is only Windows' text for code 194 ("The operating system cannot run %1. (0xc2) -
+  exit code 194") means the process ended with 194 while the client still counted it as running (`459-506`).

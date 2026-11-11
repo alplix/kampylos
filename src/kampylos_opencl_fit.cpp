@@ -181,6 +181,43 @@ static std::vector<double> opencl_eval_batch(
     CL_CHECK("clSetKernelArg(8)", cl_api.SetKernelArg(ctx.kernel, 8, sizeof(int), NULL));
     CL_CHECK("clSetKernelArg(9)", cl_api.SetKernelArg(ctx.kernel, 9, sizeof(int), NULL));
 
+#if KAMPYLOS_OPENCL_PIPELINE
+    // 2026-11-05 (KAM-035, KAM-011; switch -DKAMPYLOS_OPENCL_PIPELINE=1, off until measured on an fp64 GPU): the
+    // round in chunks (kampylos_gpu_round_chunk, the Metal app's rule), chunk k+1 on the GPU while the host
+    // completes chunk k. The kernel takes its candidate from the work-group id, so every chunk is written to the
+    // start of the candidate buffer and its results come back from the start of the result buffer; that is safe
+    // because chunk k's results are read (blocking, in-order queue) before chunk k+1 is written and launched.
+    // clFlush after each launch hands the kernel to the device at once (the blocking read of the next chunk would
+    // otherwise be the first flush, and nothing would overlap). Same candidates, kernel and completion order: the
+    // same chi2, bit for bit, as one launch. Needs cl_dynload to provide clFlush as cl_api.Flush; compiled here
+    // only against a stand-in of cl_dynload.h with Apple's OpenCL headers (syntax), never run.
+    {
+        const int chunk = kampylos_gpu_round_chunk(n, ctx.n_points, 4.0e6, 4, 64);
+        std::vector<CandidateResult> h_res(n);
+        static KampylosCpuPatchPool& pipeline_pool = *new KampylosCpuPatchPool();   // created once, never destroyed
+        size_t local_size_t = (size_t)local_size;
+        auto launch = [&](int c0) {
+            int nc = std::min(chunk, n - c0);
+            if (c0 > 0)
+                CL_CHECK("clEnqueueWriteBuffer(candidates)",
+                         cl_api.EnqueueWriteBuffer(ctx.queue, ctx.d_cand, CL_TRUE, 0, nc * sizeof(Candidate), points.data() + c0, 0, NULL, NULL));
+            CL_CHECK("clSetKernelArg(5)", cl_api.SetKernelArg(ctx.kernel, 5, sizeof(int), &nc));
+            size_t global_size = (size_t)nc * local_size;
+            CL_CHECK("clEnqueueNDRangeKernel", cl_api.EnqueueNDRangeKernel(ctx.queue, ctx.kernel, 1, NULL, &global_size, &local_size_t, 0, NULL, NULL));
+            CL_CHECK("clFlush", cl_api.Flush(ctx.queue));
+        };
+        launch(0);
+        for (int c0 = 0; c0 < n; c0 += chunk) {
+            int nc = std::min(chunk, n - c0);
+            CL_CHECK("clEnqueueReadBuffer(results)",
+                     cl_api.EnqueueReadBuffer(ctx.queue, ctx.d_res, CL_TRUE, 0, nc * sizeof(CandidateResult), h_res.data() + c0, 0, NULL, NULL));
+            if (c0 + chunk < n) launch(c0 + chunk);
+            pipeline_pool.complete_batch(h_res, points, ctx.h_data.data(), ctx.n_points, s, q, chi2, ctx.fs_bound, ctx.flux_offset, c0, nc);
+        }
+        return chi2;
+    }
+#endif
+
     size_t global_size = (size_t)n * local_size;
     size_t local_size_t = (size_t)local_size;
     CL_CHECK("clEnqueueNDRangeKernel", cl_api.EnqueueNDRangeKernel(ctx.queue, ctx.kernel, 1, NULL, &global_size, &local_size_t, 0, NULL, NULL));
@@ -231,6 +268,7 @@ BinaryFitResult opencl_fit_binary_multistart(
     BinaryFitResult out = opencl_fit_binary_seeds(ctx, data, log_s, log_q, seeds, n_restarts);
     std::vector<double> mag(data.size());
     double pr[7] = { log_s, log_q, out.u0, out.alpha, log(out.rho), log(out.tE), out.t0 };
+    kampylos_vbm_prepare(vbm);
     for (size_t i = 0; i < data.size(); i++) mag[i] = vbm.BinaryLightCurve(pr, data[i].t);
     FluxFit ff = linear_flux_fit(data, mag);
     out.fs = ff.fs; out.fb = ff.fb;

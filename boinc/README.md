@@ -40,6 +40,14 @@ GPU apps) so the version the app prints to stderr is the `version_num` the serve
 Run it in a directory with the two input files the app expects, `in` (one line, see `src/kampylos_wu.h`) and
 `photometry` (the event's light curve); it writes `out`. Outside a BOINC client it runs standalone.
 
+**The compiler version changes the last digits.** No build line sets `-ffp-contract`, so each compiler fuses
+multiply-adds as its default says: GCC on arm64 does (thousands of FMAs in VBMicrolensing), GCC on x86_64 without `-mfma`
+cannot, Apple clang 14 did not, and Apple clang 21 (Command Line Tools for macOS 27) does. Measured on 2026-11-04 on an
+Apple M4: the same source gives chi2 411.3206 on the planet profile with clang 21's default and 411.3205 with
+`-ffp-contract=off`, the value of the clang 14 builds, at no measured speed cost (`docs/BENCHMARK.md`, "Results on an
+Apple M4"). If results of different app versions or platforms are compared (KAM-025), add `-ffp-contract=off` to every
+compile line so a new Xcode or GCC cannot move them.
+
 ## Build (Metal, macOS)
 
 ```
@@ -99,6 +107,17 @@ On a restart the app resumes from `min(kampylos_checkpoint, complete lines in ou
 authoritative record of finished cells, so a missing or stale checkpoint file never costs a finished cell. Inside a
 cell both the CPU and the GPU apps resume bit-identically, and report progress after every seed / every round.
 
+## Elapsed time limit
+
+The client aborts a task whose elapsed time passes `rsc_fpops_bound` divided by the speed the scheduler learned from
+the host's valid tasks, with exit status 197 ("exceeded elapsed time limit"). A restart keeps the elapsed time, so
+checkpoints do not help, and nothing in the app can raise the limit: the work units must carry a bound that covers
+their slowest cell. With one estimate for every CPU work unit (3e13, bound 1.2e15 in November 2026) the limit is 40
+average tasks of the host, and the tasks of events whose single-lens anchor ends at the tE bound of 3000 d cost more:
+on 2026-11-08 they failed on macOS (arm64, x86_64) and Windows alike (KAM-041, shared pattern PAT-034). After such an
+abort the stderr shows the BOINC library's trace ("Crashed executable name" on macOS, "Breakpoint Encountered" and a
+debugger dump on Windows), not a crash of the app.
+
 ## Tests
 
 - `tests/test_cpu_resume.cpp` -- the resumable seed loop and the result-file helpers (seconds).
@@ -144,3 +163,77 @@ byte-identical (`cmp`), and so are the per-seed fits printed at `%.17g`.
 Check a new build before shipping it: build `src/fit_event.cpp` the old way and the new way, run the same work unit through
 both (e.g. the synthetic planet one above) and `cmp` the two result files. On one toolchain they must be byte-identical.
 Builds from different compilers can differ in the last printed digits, so compare like with like.
+
+These gains are M1 figures (macOS 15). On an Apple M4 Pro with macOS 27 and Apple clang 21 (2026-11-04) the same
+build gained 1.21x: a thread_local costs little there (plain statics alone 1.07x) and jemalloc alone gave 1.13x. On
+Linux (arm64, GCC 12, glibc 2.36, in a container) plain statics change nothing, because a thread_local costs a single
+load there; jemalloc or mimalloc gained 1.10-1.11x on the quiet M4 (within noise on the loaded M1). With emulated TLS
+(MinGW-w64 GCC, which still emulates it in version 16.2) plain statics gained 1.65x on the M1 and 1.32x on the M4
+(`docs/BENCHMARK.md`, "Other platforms"). The Windows build compiles and gives the same result lines in every library
+form (MinGW-w64 GCC 16.2, run under Wine, `scripts/bench/cross_check.sh`).
+
+## Faster GPU app build (same results)
+
+The GPU apps need the thread_local library (their completion threads), and on a cell where the source crosses a caustic
+they spend most of their time in it: on 60 seeds of the synthetic planet's cell the Metal app spent 13 s on the GPU and
+154 s completing the finite-source points on the CPU (2026-11-04, `docs/BENCHMARK.md`). Two build-level changes, no
+change to the search, byte-identical result files:
+
+1. **One thread_local block per function.** `python3 vendor/patch_vbm_thread_local.py --block` keeps every static
+   thread_local but gathers each function's statics into one struct, so a call pays one TLS lookup instead of one per
+   access. Restore the fork with `git -C vendor/VBMicrolensing checkout -- .` afterwards.
+2. **The faster allocator**, as for the CPU app.
+
+Measured on an Apple M1 with `scripts/bench` (profile `planet-gpu`, 3 interleaved runs each, median): Metal app 189.5 s
+with the build line above, 145.2 s with `--block`, 138.4 s with jemalloc, 112.0 s with both (1.69x); every run wrote the
+same result lines. `scripts/bench/mac_ab.sh` repeats the comparison on any Mac, and `scripts/bench/check_change.sh`
+runs the correctness checks. The same two changes apply to the CUDA and OpenCL apps, whose completion step is the same
+code; they were not measured there. What they gain depends on the platform (`docs/BENCHMARK.md`, "Other platforms"):
+`--block` gained 1.26x with emulated TLS (as MinGW-w64 GCC builds) and nothing with GCC 12 on Linux, and jemalloc gained
+nothing clear with glibc. On the M4 Pro (macOS 27) the Metal app gained 1.09x on `planet-gpu` (62.8 s against 68.7 s):
+`--block` costs nothing there and gains nothing, jemalloc gives the rest; keep both for older Macs.
+
+The largest lever of the GPU apps is not a build flag but the number of completion threads, which the client's CPU
+budget (the plan class's `avg_ncpus`) sets: on the M4 Pro 2, 4 and 8 threads ran `planet-gpu` 1.66x, 2.52x and 3.38x
+faster than one, for 3-9 % more CPU time in total. The result lines then differ at rounding level (KAM-012), so it is a
+server-side decision; built with history-free evaluations (below) they do not.
+
+The Metal app also overlaps GPU and CPU work inside a round (`src/kampylos_metal_fit.mm`, since 2026-11-04): 1.12-1.14x
+on a whole cell on the M1, 1.03x on the M4 Pro, whose faster GPU leaves less to hide; same result line. That is a source change, so it comes with the next Metal app version, whatever the
+build line.
+
+## Switches for the next app versions (2026-11-05)
+
+Measured on an Apple M4 Pro (`docs/BENCHMARK.md`, "Results on an Apple M4 (2026-11-05)"). All are off by default, so
+the build lines above build what they built before (the same result lines, checked).
+
+* **Free lists for the library's small objects, same results:** `python3 vendor/patch_vbm_thread_local.py --strip --pool`
+  (CPU app) or `--block --pool` (GPU apps). The CPU app 1.10x faster with jemalloc and 1.22-1.24x with the system
+  allocator, which then is as fast as jemalloc; the Metal app 1.09x; byte-identical result lines. For builds that cannot
+  link jemalloc (Windows, Android) this is the allocator gain without it; the Windows heap itself was not measured.
+* **History-free evaluations, a one-time change of results:** add `--reset` to the patch script's options and
+  `-DKAMPYLOS_RESET_STATE=1` to every compile line of the app. Every candidate evaluation then starts from the same
+  library state (`src/kampylos_vbm_state.h`): resumed tasks and seed-split parts give each seed exactly the fit of an
+  uninterrupted run (KAM-030), and the GPU apps' result no longer depends on the number of completion threads
+  (KAM-012). It costs nothing measurable. It changes results that depended on the order of calls (a 10-seed test moved
+  by -0.11 in chi2; three whole cells kept their lines), so it needs a new app version. For example:
+  ```
+  python3 vendor/patch_vbm_thread_local.py --strip --reset --pool
+  g++ -O2 -std=c++17 -DKAMPYLOS_RESET_STATE=1 -I src -I $VBM -I <boinc>/api -I <boinc>/lib -c boinc/main_kampylos_boinc.cpp -o main.o
+  g++ -O2 -std=c++17 -I $VBM -c $VBM/VBMicrolensingLibrary.cpp -o vbm.o
+  ```
+* **A threaded CPU app:** built from the thread-safe library (the fork, or `--block`) with `--reset` and
+  `-DKAMPYLOS_RESET_STATE=1`, the CPU app fits the seeds of a cell on as many threads as the client budgets CPUs for the
+  task (`init_data` ncpus, the plan class's `avg_ncpus`; `src/kampylos_cpu_seed_pool.h`), with the result of one
+  thread. Today's CPU plan class gives one CPU, and the app then runs one thread as before; an `mt` plan class with
+  `avg_ncpus` N would finish a task about N times sooner for the same CPU time, which matters most for the day-long
+  tasks of events without a baseline. The app prints `seed threads: N` at the start.
+* **Helper threads pause while the task is suspended (KAM-027):** every wrapper now points `kampylos_worker_pause()` at a
+  wait on `boinc_get_status()`, and the completion and seed threads block SIGALRM. No build change.
+* **CUDA and OpenCL round split (KAM-035):** `-DKAMPYLOS_CUDA_PIPELINE=1` / `-DKAMPYLOS_OPENCL_PIPELINE=1` overlap the GPU
+  and the host completion as the Metal app does. Not measured, and the CUDA code not even compiled: try it on a GPU host
+  before using it (the OpenCL one needs `cl_api.Flush` in cl_dynload).
+* **Search changes, for the maintainers:** `scripts/bench/patches/nm-stopping.patch` (restart only after a gain above
+  1e-3, stop a pass stalled for 100 iterations at 1e-4) takes about 2x less CPU on three whole cells with the same cell
+  chi2, with history-free evaluations on. `-DKAMPYLOS_SEEDS_HALF=1` (half of each mirror pair of seeds) lost the best
+  minimum on two of three cells: not proposed. `-DKAMPYLOS_VBM_RELTOL` changed nothing on the measured cells.

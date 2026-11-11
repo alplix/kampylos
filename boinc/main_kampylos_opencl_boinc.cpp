@@ -56,6 +56,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "boinc_init_options failed: %d\n", rc);
         return rc;
     }
+    kampylos_boinc_install_worker_pause();   // completion threads wait while the task is suspended (KAM-027)
 
     // Real bug, forum report 2026-10-05 (main BOINC forum, "Only one GPU being used but
     // BOINC says one task is on GPU0 and the other on GPU1"): the client's own

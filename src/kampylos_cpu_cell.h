@@ -19,6 +19,7 @@
 #include <string>
 #include <vector>
 #include "binary_fit.h"
+#include "kampylos_cpu_seed_pool.h"
 
 struct KampylosSeedCheckpoint {
     int cell = 0;
@@ -58,11 +59,14 @@ struct KampylosCellHooks {
 
 // Fits one cell's seed set with the seed-level checkpoint. ln_s/ln_q are natural logs.
 // *completed is set to false only when keep_going() asked to stop before the last seed.
+// pool (2026-11-05): with more than one thread, the seeds are fitted on the pool's threads and merged here in
+// seed order, so progress, checkpoints and the result are those of the loop below (kampylos_cpu_seed_pool.h).
 inline BinaryFitResult kampylos_fit_cell_resumable(
     VBMicrolensing& vbm, const std::vector<DataPoint>& data,
     double ln_s, double ln_q, const BinarySeedSet& seeds,
     int cell, int part, int nparts,
-    const KampylosCellHooks& h, FILE* log = nullptr, bool* completed = nullptr
+    const KampylosCellHooks& h, FILE* log = nullptr, bool* completed = nullptr,
+    KampylosSeedPool* pool = nullptr
 ) {
     const size_t n = seeds.x0.size();
     BinaryFitResult best{};
@@ -79,6 +83,27 @@ inline BinaryFitResult kampylos_fit_cell_resumable(
     for (size_t k = 0; k < n; k++) if (k % K == P) { own_total++; if (k < k0) own_before++; }
     size_t own_done = own_before;
     if (completed) *completed = true;
+    if (pool && pool->threads() > 1) {
+        std::vector<size_t> idx;
+        for (size_t k = k0; k < n; k++) if (k % K == P) idx.push_back(k);
+        pool->run(data, ln_s, ln_q, seeds, idx, [&](size_t j, const BinaryFitResult& r) {
+            size_t k = idx[j];
+            if (r.chi2 < best.chi2) best = r;
+            own_done++;
+            if (h.progress) h.progress((double)own_done / (double)(own_total ? own_total : 1));
+            if (h.time_to_checkpoint && h.time_to_checkpoint()) {
+                if (h.write_checkpoint) h.write_checkpoint(KampylosSeedCheckpoint{ cell, k + 1, best });
+                if (h.checkpoint_completed) h.checkpoint_completed();
+            }
+            if (h.keep_going && !h.keep_going()) {
+                if (completed) *completed = false;
+                return false;
+            }
+            return true;
+        });
+        (void)vbm;
+        return best;
+    }
     for (size_t k = k0; k < n; k++) {
         if (k % K != P) continue;
         BinaryFitResult r = fit_binary_local_steps(vbm, data, ln_s, ln_q, seeds.x0[k], seeds.step[k]);

@@ -1,0 +1,6 @@
+# The whole far cell of the synthetic planet (all 240 seeds, log10 s = 0.2, log10 q = -5): no planetary caustic on
+# the trajectory, but the large source still sends the points near the peak to the finite-source integration.
+# About 3 minutes with the fast CPU build on an Apple M4 Pro.
+photometry tests/regression/synthetic_planet.dat
+in flux 0.2 0.2 1 -5 -5 1 log10
+ncpus 1

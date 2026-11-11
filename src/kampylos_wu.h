@@ -211,6 +211,7 @@ inline KampylosCellDiag kampylos_finalize_cell(VBMicrolensing& vbm, const std::v
     std::vector<double> mag(n);
     double pr[7] = { r.log_s, r.log_q, r.u0, r.alpha, log(r.rho), log(r.tE), r.t0 };
     bool ok = std::isfinite(r.chi2) && r.chi2 < 1e17;
+    kampylos_vbm_prepare(vbm);   // -DKAMPYLOS_RESET_STATE=1 (kampylos_vbm_state.h)
     for (size_t i = 0; ok && i < n; i++) {
         mag[i] = vbm.BinaryLightCurve(pr, data[i].t);
         if (!std::isfinite(mag[i]) || mag[i] <= 0) ok = false;

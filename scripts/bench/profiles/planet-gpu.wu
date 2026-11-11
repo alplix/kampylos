@@ -1,0 +1,5 @@
+# The planet cell with 60 of its 240 seeds (k % 4 == 0): bigger GPU rounds than the planet profile (about 41 candidates
+# on average, 360 in the first round).
+photometry tests/regression/synthetic_planet.dat
+in flux 0.2 0.2 1 -3 -3 1 log10 part 0 4
+ncpus 1

@@ -10,7 +10,7 @@ next: Review and merge a65e139 (tag archive/fix/opencl-work-group-size); it merg
 pattern: PAT-015
 aliases: [fix/opencl-work-group-size]
 reported: 2026-10-12
-source: review 2026-10-12 (commit a65e139), kampylos-report-2026-10-16.html §4.3
+source: review 2026-10-12 (commit a65e139), docs/BENCHMARK.md "Measurements of 2026-10-16" §4.3
 where: src/kampylos_opencl_fit.cpp:171-186 @ 45a41d5
 fixed_in:
 ---

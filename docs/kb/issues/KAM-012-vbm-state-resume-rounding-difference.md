@@ -9,7 +9,7 @@ area: determinism
 pattern:
 aliases: [B1]
 reported: 2026-10-12
-source: commit 7da5519 (2026-10-12), kampylos-report-2026-10-16.html §2.4, Metal review 2026-10-19 §4
+source: commit 7da5519 (2026-10-12), docs/BENCHMARK.md "Measurements of 2026-10-16" §2.4, Metal review 2026-10-19 §4
 where: src/kampylos_cpu_patch_pool.h:167-173 @ 45a41d5
 fixed_in:
 ---
@@ -46,9 +46,17 @@ the GPU apps").
 
 ## Fix
 
-None planned. `boinc/README.md:98-100` claims both apps resume bit-identically, which holds for one thread only
-(KAM-020). Whether the difference is acceptable, and whether the resume test should compare numerically, is
-question KAM-021.
+Until 2026-11-05 none planned. `boinc/README.md:98-100` claims both apps resume bit-identically, which holds for one
+thread only (KAM-020). Whether the difference is acceptable, and whether the resume test should compare numerically,
+is question KAM-021.
+
+Proposed on 2026-11-05 with KAM-030 (switch `-DKAMPYLOS_RESET_STATE=1`, off by default, needs the library prepared
+with `vendor/patch_vbm_thread_local.py --reset`): `kampylos_complete_candidate()` resets the root solver's warm start
+before every candidate (`src/kampylos_vbm_state.h`), so a candidate's chi2 no longer depends on which candidates its
+completion thread did before. Measured on an Apple M4 Pro, Metal app, profile `planet-gpu`: the same result line with
+1, 2, 4 and 8 completion threads (without the switch, 1 and 4 threads differ by 0.0006 in chi2); no measurable cost.
+With the switch the answer to KAM-021 becomes "no difference", and the thread count of KAM-032 no longer changes the
+result. The skip-list levels from `std::random_device` remain per process; they did not change any result.
 
 ## Test
 
@@ -58,3 +66,4 @@ question KAM-021.
 
 - 2026-10-27: recorded from the 2026-10-21 audit (plan B1) and the 2026-10-16 and 2026-10-19 reports, code paths
   verified at 45a41d5 by reading; the measurements are from those reports, not repeated.
+- 2026-11-05: 2026-11-05: fixed behind -DKAMPYLOS_RESET_STATE=1 (with KAM-030): Metal app on planet-gpu gives the same line with 1, 2, 4 and 8 completion threads

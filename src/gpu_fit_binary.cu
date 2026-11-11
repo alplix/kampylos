@@ -44,10 +44,32 @@ static std::vector<double> gpu_eval_batch(
 
     int block_size = 128;
     size_t shmem = KAMPYLOS_NREDUCE * block_size * sizeof(double);
+    std::vector<CandidateResult> h_res(n);
+#if KAMPYLOS_CUDA_PIPELINE
+    // 2026-11-05 (KAM-035, KAM-011; switch -DKAMPYLOS_CUDA_PIPELINE=1, off until measured on an NVIDIA host): the
+    // round in chunks (kampylos_gpu_round_chunk, the Metal app's rule), chunk k+1 launched before the host
+    // completes chunk k. Each chunk's results are copied back before the next chunk is launched, so the blocking
+    // copy waits for that chunk's kernel only (one in-order stream) and the GPU then computes chunk k+1 while the
+    // pool completes chunk k. Same candidates, kernel and completion order: the same chi2, bit for bit, as one
+    // launch. Not compiled or run in this repository's checks (no CUDA toolkit on the machines used so far).
+    const int chunk = kampylos_gpu_round_chunk(n, ctx.n_points, 4.0e6, 4, 64);
+    auto launch = [&](int c0) {
+        int nc = std::min(chunk, n - c0);
+        kampylos_eval_candidates<<<nc, block_size, shmem>>>(ctx.d_data, ctx.n_points, s, q, ctx.d_cand + c0, nc, ctx.d_res + c0);
+        CUDA_CHECK_RT(cudaGetLastError());
+    };
+    static KampylosCpuPatchPool& pipeline_pool = *new KampylosCpuPatchPool();   // created once, never destroyed (see below)
+    launch(0);
+    for (int c0 = 0; c0 < n; c0 += chunk) {
+        int nc = std::min(chunk, n - c0);
+        CUDA_CHECK_RT(cudaMemcpy(h_res.data() + c0, ctx.d_res + c0, nc * sizeof(CandidateResult), cudaMemcpyDeviceToHost));
+        if (c0 + chunk < n) launch(c0 + chunk);
+        pipeline_pool.complete_batch(h_res, points, ctx.h_data.data(), ctx.n_points, s, q, chi2, ctx.fs_bound, ctx.flux_offset, c0, nc);
+    }
+    return chi2;
+#endif
     kampylos_eval_candidates<<<n, block_size, shmem>>>(ctx.d_data, ctx.n_points, s, q, ctx.d_cand, n, ctx.d_res);
     CUDA_CHECK_RT(cudaGetLastError());
-
-    std::vector<CandidateResult> h_res(n);
     CUDA_CHECK_RT(cudaMemcpy(h_res.data(), ctx.d_res, n * sizeof(CandidateResult), cudaMemcpyDeviceToHost));
 
     // Was a single-threaded loop calling kampylos_complete_candidate() once per candidate here,
@@ -115,6 +137,7 @@ BinaryFitResult gpu_fit_binary_multistart(
     BinaryFitResult out = gpu_fit_binary_seeds(ctx, data, log_s, log_q, seeds, n_restarts);
     std::vector<double> mag(data.size());
     double pr[7] = { log_s, log_q, out.u0, out.alpha, log(out.rho), log(out.tE), out.t0 };
+    kampylos_vbm_prepare(vbm);
     for (size_t i = 0; i < data.size(); i++) mag[i] = vbm.BinaryLightCurve(pr, data[i].t);
     FluxFit ff = linear_flux_fit(data, mag);
     out.fs = ff.fs; out.fb = ff.fb;

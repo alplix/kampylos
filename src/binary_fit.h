@@ -18,6 +18,8 @@
 #include "simplex.h"
 #include "lightcurve.h"
 #include "../vendor/VBMicrolensing/VBMicrolensing/lib/VBMicrolensingLibrary.h"
+#include "kampylos_vbm_state.h"
+#include "kampylos_pause.h"
 
 // M_PI is a common extension (glibc, etc.), not standard C++ -- MSVC/mingw only define it
 // when _USE_MATH_DEFINES is set before <cmath> is first included, which isn't guaranteed given
@@ -33,9 +35,33 @@ struct BinaryFitResult {
     double fs, fb, chi2;
 };
 
+// The CPU objective: chi2 of the candidate x = (t0, u0, ln tE, alpha, ln rho) at the cell (log_s, log_q),
+// natural logs, with the best (fs, fb); 1e18 for a candidate outside the valid range or with a magnification
+// that is not finite and positive. mag: scratch, data.size() values; fs_bound: flux_fit_bound(data).
+// pr[] order matches VBMicrolensing's BinaryLightCurve: [ln s, ln q, u0, alpha, ln rho, ln tE, t0].
+// A function of its own since 2026-11-05 (it was the lambda in fit_binary_local_steps, same code), so that
+// tests/test_vbm_state_reset.cpp checks the objective the app uses.
+inline double kampylos_binary_chi2(VBMicrolensing& vbm, const std::vector<DataPoint>& data, double log_s, double log_q,
+                                   const std::vector<double>& x, std::vector<double>& mag, double fs_bound) {
+    double t0 = x[0], u0 = x[1], log_tE = x[2], alpha = x[3], log_rho = x[4];
+    double tE = exp(log_tE);
+    if (tE < 0.01 || tE > 10000.0) return 1e18;
+    double rho = exp(log_rho);
+    if (rho < 1e-6 || rho > 1.0) return 1e18;
+
+    double pr[7] = { log_s, log_q, u0, alpha, log_rho, log_tE, t0 };
+    kampylos_worker_pause();   // a seed-pool thread waits here while the task is suspended (kampylos_pause.h)
+    kampylos_vbm_prepare(vbm);   // -DKAMPYLOS_RESET_STATE=1: the same chi2 whatever ran before (kampylos_vbm_state.h)
+    for (size_t i = 0; i < data.size(); i++) {
+        double a = vbm.BinaryLightCurve(pr, data[i].t);
+        if (!std::isfinite(a) || a <= 0) return 1e18;
+        mag[i] = a;
+    }
+    return linear_flux_fit(data, mag, fs_bound).chi2;
+}
+
 // One local optimization run from an explicit starting point/simplex step.
-// x = (t0, u0, ln tE, alpha, ln rho); pr[] order matches VBMicrolensing's BinaryLightCurve:
-// [ln s, ln q, u0, alpha, ln rho, ln tE, t0]. n_restarts controls how many
+// x = (t0, u0, ln tE, alpha, ln rho). n_restarts controls how many
 // restart-from-converged passes follow the initial simplex run.
 inline BinaryFitResult fit_binary_local_steps(
     VBMicrolensing& vbm,
@@ -48,19 +74,7 @@ inline BinaryFitResult fit_binary_local_steps(
     const double fs_bound = flux_fit_bound(data);
 
     auto objective = [&](const std::vector<double>& x) -> double {
-        double t0 = x[0], u0 = x[1], log_tE = x[2], alpha = x[3], log_rho = x[4];
-        double tE = exp(log_tE);
-        if (tE < 0.01 || tE > 10000.0) return 1e18;
-        double rho = exp(log_rho);
-        if (rho < 1e-6 || rho > 1.0) return 1e18;
-
-        double pr[7] = { log_s, log_q, u0, alpha, log_rho, log_tE, t0 };
-        for (size_t i = 0; i < data.size(); i++) {
-            double a = vbm.BinaryLightCurve(pr, data[i].t);
-            if (!std::isfinite(a) || a <= 0) return 1e18;
-            mag[i] = a;
-        }
-        return linear_flux_fit(data, mag, fs_bound).chi2;
+        return kampylos_binary_chi2(vbm, data, log_s, log_q, x, mag, fs_bound);
     };
 
     SimplexResult res = nelder_mead(objective, x0, step, max_iter, 1e-9, 1e-8);
@@ -82,6 +96,7 @@ inline BinaryFitResult fit_binary_local_steps(
     out.chi2 = res.fval;
 
     double pr[7] = { log_s, log_q, out.u0, out.alpha, log(out.rho), log(out.tE), out.t0 };
+    kampylos_vbm_prepare(vbm);
     for (size_t i = 0; i < data.size(); i++) mag[i] = vbm.BinaryLightCurve(pr, data[i].t);
     FluxFit ff = linear_flux_fit(data, mag, fs_bound);
     out.fs = ff.fs; out.fb = ff.fb;
@@ -218,8 +233,26 @@ struct BinarySeedAnchors {
 // trajectory, and the optimizer can only go down from there. (Near s ~ 1 with q >~ 0.1 the
 // resonant caustic cannot be avoided, so there a binary genuinely may not reproduce a single
 // lens; those cells legitimately stay above the anchor.)
+//
+// MIRROR PAIRS (2026-11-05, KAM-039; a science change behind -DKAMPYLOS_SEEDS_HALF=1, off by default).
+// The trajectory y1 = u0 sin(alpha) - tn cos(alpha), y2 = -u0 cos(alpha) - tn sin(alpha) (BinaryLightCurve and
+// every kernel) keeps y1 and flips the sign of y2 under (u0, alpha) -> (-u0, -alpha), and BinaryMag2 uses |y2|
+// (the lens is symmetric about its axis): the two give the same light curve for every t0, tE and rho. Every
+// family below is built with both signs of u0 on an alpha grid that is closed under negation -- (A), (B), (D):
+// alpha_i = 2 pi i / 8, the mirror of (-, alpha_i) is (+, alpha_(8-i)); (C): alpha_i = 2 pi (i + 0.5) / 8 with
+// u0_b = u0_c + x_c sin(alpha), t0_b = t0 + tE_b x_c cos(alpha), the mirror of (-, alpha_i) is (+, alpha_(7-i))
+// -- so the set is pairs of starting points on the same landscape. They are not duplicates: the simplex steps
+// are not mirrored (+0.05 in u0 is not the mirror of +0.05) and alpha and 2 pi - alpha differ in the last bit,
+// so the two Nelder-Mead runs of a pair take different paths and can end in different minima. The switch keeps
+// the + half (half the work on every backend). Measured 2026-11-05 on whole cells (docs/BENCHMARK.md): the planet
+// cell kept its minimum (in the mirror form), the OGLE and far cells lost theirs by 23 and 35 in chi2 -- the two
+// runs of a pair are independent attempts that the search needs. Kept as an experiment, not proposed.
+#ifndef KAMPYLOS_SEEDS_HALF
+#define KAMPYLOS_SEEDS_HALF 0
+#endif
 inline BinarySeedSet kampylos_make_seeds(const BinarySeedAnchors& a, double s, double q, int n_alpha_seeds = 8) {
     BinarySeedSet set;
+    const bool both_signs = !KAMPYLOS_SEEDS_HALF;
     // (A) + (B): the original multistart grid around each anchor -- 8 alpha x 2 |u0| x 2 signs
     // x 3 rho = 96 seeds each, the same as fit_binary_multistart_dual_anchor() except that the
     // first rho seed comes from the finite-source anchor when it measured one.
@@ -234,6 +267,7 @@ inline BinarySeedSet kampylos_make_seeds(const BinarySeedAnchors& a, double s, d
             for (double u0_mag : u0_mag_seeds)
                 for (double u0_sign : { 1.0, -1.0 })
                     for (double rs : rho_seeds)
+                        if (both_signs || u0_sign > 0)
                         set.add({ an.t0, u0_sign * u0_mag, log(an.tE), alpha_seed, log(rs) },
                                 { std::max(0.5, an.tE * 0.05), 0.05, 0.2, 0.3, 0.5 });
         }
@@ -251,6 +285,7 @@ inline BinarySeedSet kampylos_make_seeds(const BinarySeedAnchors& a, double s, d
         for (int i = 0; i < n_alpha_seeds; i++) {
             double alpha = 2.0 * M_PI * (i + 0.5) / n_alpha_seeds; // between (A)'s angles
             for (double sgn : { 1.0, -1.0 }) {
+                if (!both_signs && sgn < 0) continue;
                 double u0_c = sgn * std::fabs(a.sl_u0) * th;
                 double u0_b = u0_c + x_c * sin(alpha);
                 double t0_b = a.sl_t0 + tE_b * x_c * cos(alpha);
@@ -264,6 +299,7 @@ inline BinarySeedSet kampylos_make_seeds(const BinarySeedAnchors& a, double s, d
         for (int i = 0; i < n_alpha_seeds; i++) {
             double alpha_seed = 2.0 * M_PI * i / n_alpha_seeds;
             for (double u0_sign : { 1.0, -1.0 })
+                if (both_signs || u0_sign > 0)
                 set.add({ al[0], u0_sign * std::max(std::fabs(al[1]), 1e-4), log(al[2]), alpha_seed, log(rho_seed) },
                         { std::max(0.5, al[2] * 0.05), 0.05, 0.2, 0.3, 0.5 });
         }

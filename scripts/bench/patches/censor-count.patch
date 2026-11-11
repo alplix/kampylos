@@ -1,0 +1,167 @@
+--- a/src/simplex.h
++++ b/src/simplex.h
+@@ -8,6 +8,14 @@
+ #include <algorithm>
+ #include <cmath>
+ 
++// Bench instrumentation (scripts/bench/patches/censor-count.patch, not in the apps): the kind of the next
++// evaluation and the value it is compared with -- 0 initial vertex, 1 reflection (stored only if below the
++// second-worst value), 2 expansion (only if below the reflection's), 3 contraction (only if below the worst),
++// 4 shrink vertex (always stored).
++struct KampylosEvalKind { int kind = 0; double cutoff = 1e300; };
++inline KampylosEvalKind& kampylos_eval_kind() { static KampylosEvalKind k; return k; }
++inline void kampylos_set_eval_kind(int kind, double cutoff) { kampylos_eval_kind().kind = kind; kampylos_eval_kind().cutoff = cutoff; }
++
+ struct SimplexResult {
+     std::vector<double> x;
+     double fval;
+@@ -32,6 +40,7 @@
+     for (int i = 0; i < n; i++) simplex[i + 1][i] += step[i];
+ 
+     std::vector<double> fval(n1);
++    kampylos_set_eval_kind(0, 1e300);
+     for (int i = 0; i < n1; i++) fval[i] = f(simplex[i]);
+ 
+     const double alpha = 1.0, gamma = 2.0, rho = 0.5, sigma = 0.5;
+@@ -65,11 +74,13 @@
+         std::vector<double> worst = simplex[n];
+         std::vector<double> xr(n);
+         for (int j = 0; j < n; j++) xr[j] = centroid[j] + alpha * (centroid[j] - worst[j]);
++        kampylos_set_eval_kind(1, fval[n - 1]);
+         double fr = f(xr);
+ 
+         if (fr < fval[0]) {
+             std::vector<double> xe(n);
+             for (int j = 0; j < n; j++) xe[j] = centroid[j] + gamma * (xr[j] - centroid[j]);
++            kampylos_set_eval_kind(2, fr);
+             double fe = f(xe);
+             if (fe < fr) { simplex[n] = xe; fval[n] = fe; }
+             else { simplex[n] = xr; fval[n] = fr; }
+@@ -78,11 +89,13 @@
+         } else {
+             std::vector<double> xc(n);
+             for (int j = 0; j < n; j++) xc[j] = centroid[j] + rho * (worst[j] - centroid[j]);
++            kampylos_set_eval_kind(3, fval[n]);
+             double fc = f(xc);
+             if (fc < fval[n]) { simplex[n] = xc; fval[n] = fc; }
+             else {
+                 for (int i = 1; i < n1; i++) {
+                     for (int j = 0; j < n; j++) simplex[i][j] = simplex[0][j] + sigma * (simplex[i][j] - simplex[0][j]);
++                    kampylos_set_eval_kind(4, 1e300);
+                     fval[i] = f(simplex[i]);
+                 }
+             }
+--- a/src/binary_fit.h
++++ b/src/binary_fit.h
+@@ -20,6 +20,89 @@
+ #include "../vendor/VBMicrolensing/VBMicrolensing/lib/VBMicrolensingLibrary.h"
+ #include "kampylos_vbm_state.h"
+ #include "kampylos_pause.h"
++#include <chrono>
++#include <cstdio>
++#include <cstdlib>
++
++// ---- bench instrumentation (scripts/bench/patches/censor-count.patch, not in the apps) -----------------
++// For every objective evaluation: would a lower bound of chi2 have shown, before all finite-source points
++// were computed, that Nelder-Mead rejects the value (see simplex.h's KampylosEvalKind)? The bound is the
++// least-squares chi2 over a subset of the points with its own best (fs, fb): never above the chi2 of all of
++// them. Two orders: time order (what the objective computes today) and cheap first (all point-source points,
++// then the finite-source points in time order, which is what a GPU app's completion step sees). Cost: the
++// contour samples VBMicrolensing reports (NPS, 1 for a point-source point) and the measured time per point.
++// Printed to stderr at exit.
++struct KampylosCensorStats {
++    double n[5] = {}, rej[5] = {}, cost[5] = {}, fscost[5] = {}, skip_cf[5] = {}, skip_to[5] = {};
++    double tim[5] = {}, fstim[5] = {}, tskip_cf[5] = {}, tskip_to[5] = {}, violations = 0, nfs[5] = {};
++};
++inline KampylosCensorStats& kampylos_censor_stats() { static KampylosCensorStats s; return s; }
++inline void kampylos_censor_print() {
++    const KampylosCensorStats& s = kampylos_censor_stats();
++    const char* names[5] = { "init", "reflect", "expand", "contract", "shrink" };
++    double N = 0, C = 0, FC = 0, SC = 0, ST = 0, T = 0, FT = 0, TC = 0, TT = 0;
++    fprintf(stderr, "censor-count: kind       evals  rejected  cost(NPS)  fs-cost  skip(cheap-first)  skip(time-order)  time s  fs-time s  tskip(cf) s  tskip(to) s\n");
++    for (int k = 0; k < 5; k++) {
++        fprintf(stderr, "censor-count: %-9s %7.0f %9.0f %10.3g %8.3g %18.3g %17.3g %7.2f %10.2f %12.2f %12.2f\n", names[k], s.n[k], s.rej[k],
++                s.cost[k], s.fscost[k], s.skip_cf[k], s.skip_to[k], s.tim[k], s.fstim[k], s.tskip_cf[k], s.tskip_to[k]);
++        N += s.n[k]; C += s.cost[k]; FC += s.fscost[k]; SC += s.skip_cf[k]; ST += s.skip_to[k]; T += s.tim[k]; FT += s.fstim[k];
++        TC += s.tskip_cf[k]; TT += s.tskip_to[k];
++    }
++    fprintf(stderr, "censor-count: total evals %.0f; cost %.4g (finite-source %.1f %%); cheap-first skips %.1f %% of the cost "
++                    "(%.1f %% of the finite-source cost), time order %.1f %%; time %.2f s (finite-source %.1f %%), cheap-first "
++                    "skips %.1f %% of it, time order %.1f %%; bound violations %.0f\n",
++            N, C, 100 * FC / C, 100 * SC / C, 100 * SC / FC, 100 * ST / C, T, 100 * FT / T, 100 * TC / T, 100 * TT / T, s.violations);
++}
++// Least-squares chi2 of the six weighted sums (flux centred), 0 when (fs, fb) are not determined.
++inline double kampylos_censor_bound(double AA, double A1, double S11, double Ay, double S1y, double yy) {
++    double diag = AA * S11, det = diag - A1 * A1;
++    if (!(diag > 0) || !(det > 1e-8 * diag)) return 0;
++    double fs = (S11 * Ay - A1 * S1y) / det, fb = (AA * S1y - A1 * Ay) / det;
++    double lb = yy - fs * Ay - fb * S1y;
++    return std::isfinite(lb) && lb > 0 ? lb : 0;
++}
++inline void kampylos_censor_record(const std::vector<DataPoint>& data, const std::vector<double>& mag,
++                                   const std::vector<double>& cost, const std::vector<double>& tim, size_t n_done, double v) {
++    static bool registered = false;
++    if (!registered) { registered = true; atexit(kampylos_censor_print); }
++    KampylosCensorStats& s = kampylos_censor_stats();
++    const int k = kampylos_eval_kind().kind;
++    const double cutoff = kampylos_eval_kind().cutoff;
++    const double thr = cutoff + 1e-9 * std::fabs(cutoff) + 1e-9;   // margin for rounding, as an app would use
++    double C = 0, FC = 0, T = 0, FT = 0, nfs = 0;
++    for (size_t i = 0; i < n_done; i++) { C += cost[i]; T += tim[i]; if (cost[i] > 1) { FC += cost[i]; FT += tim[i]; nfs++; } }
++    s.n[k]++; s.cost[k] += C; s.fscost[k] += FC; s.tim[k] += T; s.fstim[k] += FT; s.nfs[k] += nfs;
++    bool rejected = v >= cutoff;
++    s.rej[k] += rejected;
++    if (n_done < data.size() || cutoff >= 1e299) return;   // invalid candidate (1e18) or a value that is always stored
++    double sw = 0, swy = 0;
++    for (const auto& d : data) { double w = 1 / (d.sigma * d.sigma); sw += w; swy += w * d.flux; }
++    const double c = swy / sw;
++    auto add = [&](size_t i, double* S) {
++        double w = 1 / (data[i].sigma * data[i].sigma), A = mag[i], y = data[i].flux - c;
++        S[0] += w * A * A; S[1] += w * A; S[2] += w; S[3] += w * A * y; S[4] += w * y; S[5] += w * y * y;
++    };
++    auto lb = [&](const double* S) { return kampylos_censor_bound(S[0], S[1], S[2], S[3], S[4], S[5]); };
++    {   // cheap first
++        double S[6] = {};
++        for (size_t i = 0; i < data.size(); i++) if (cost[i] <= 1) add(i, S);
++        double rest = FC, trest = FT;
++        bool stop = lb(S) >= thr;
++        for (size_t i = 0; !stop && i < data.size(); i++) {
++            if (cost[i] <= 1) continue;
++            add(i, S); rest -= cost[i]; trest -= tim[i];
++            stop = lb(S) >= thr;
++        }
++        if (stop) { s.skip_cf[k] += rest; s.tskip_cf[k] += trest; if (!rejected) s.violations++; }
++    }
++    {   // time order
++        double S[6] = {}, rest = C, trest = T;
++        for (size_t i = 0; i < data.size(); i++) {
++            add(i, S); rest -= cost[i]; trest -= tim[i];
++            if (lb(S) >= thr) { s.skip_to[k] += rest; s.tskip_to[k] += trest; if (!rejected) s.violations++; break; }
++        }
++    }
++}
+ 
+ // M_PI is a common extension (glibc, etc.), not standard C++ -- MSVC/mingw only define it
+ // when _USE_MATH_DEFINES is set before <cmath> is first included, which isn't guaranteed given
+@@ -52,12 +135,19 @@
+     double pr[7] = { log_s, log_q, u0, alpha, log_rho, log_tE, t0 };
+     kampylos_worker_pause();   // a seed-pool thread waits here while the task is suspended (kampylos_pause.h)
+     kampylos_vbm_prepare(vbm);   // -DKAMPYLOS_RESET_STATE=1: the same chi2 whatever ran before (kampylos_vbm_state.h)
++    static std::vector<double> cost, tim;
++    cost.assign(data.size(), 0); tim.assign(data.size(), 0);
+     for (size_t i = 0; i < data.size(); i++) {
++        auto c0 = std::chrono::steady_clock::now();
+         double a = vbm.BinaryLightCurve(pr, data[i].t);
+-        if (!std::isfinite(a) || a <= 0) return 1e18;
++        tim[i] = std::chrono::duration<double>(std::chrono::steady_clock::now() - c0).count();
++        cost[i] = vbm.NPS;
++        if (!std::isfinite(a) || a <= 0) { kampylos_censor_record(data, mag, cost, tim, i + 1, 1e18); return 1e18; }
+         mag[i] = a;
+     }
+-    return linear_flux_fit(data, mag, fs_bound).chi2;
++    double v = linear_flux_fit(data, mag, fs_bound).chi2;
++    kampylos_censor_record(data, mag, cost, tim, data.size(), v);
++    return v;
+ }
+ 
+ // One local optimization run from an explicit starting point/simplex step.

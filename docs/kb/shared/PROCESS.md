@@ -81,6 +81,27 @@ at step 5.
 9. **Before every pull request:** `kb.py index` and `kb.py lint --strict` (fails on errors and on unchecked
    patterns). `kb.py status` prints the cross-repository matrix.
 
+## Performance work
+
+Speed is not a bug class, but the same tools apply. Each repository's `docs/BENCHMARK.md` holds the method (interleaved
+A/B runs, at least 3 rounds, medians; a candidate is faster only if its median is at least 5 % lower and its slowest run
+beats the baseline's fastest, or its median is at least 10 % lower), the profiles, where the time goes, the candidate
+speed-ups and the measured results; `scripts/bench/` holds the scripts (`mac_ab.sh`, and where they exist `linux_ab.sh`
+for Linux in a container and `cross_check.sh` for Windows and Linux x86_64 builds under emulation).
+
+* **Before a speed change:** read the repository's `docs/BENCHMARK.md` (the candidates and what was measured) and
+  `kb.py list --area performance` in every repository (`grep -l "area: performance" ../*/docs/kb/issues/*`); the
+  performance patterns (`kb.py list --patterns --area performance`) say which platform traps are known.
+* **Two kinds of change.** A change that keeps the output byte-identical on the same toolchain needs a measured gain and
+  the output check. A change of the results (search, tolerances, math) is a science change: keep it behind a switch that
+  is off by default and record its measured effect for the maintainers.
+* **Record what was found:** waste in the code as a `bug` with `area=performance` (`fix-proposed` once a measured fix
+  exists), a platform or toolchain trap as a `gotcha`, a resource decision (CPU budget of a GPU app, plan classes) as a
+  `question`. A platform that was not measured is called unmeasured, in the issue and in the docs.
+* **No surprises for volunteers:** a change that touches a build must at least compile, run and give the expected output
+  on every platform that can be reached (a MinGW-w64 cross build and Wine, an x86_64 container), even where its speed
+  cannot be measured.
+
 ## Rules
 
 * **Everything here is public.** No secrets, keys, server addresses, host names, user names, e-mail or IP addresses,

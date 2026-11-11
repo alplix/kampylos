@@ -1,0 +1,5 @@
+# The whole OGLE cell (all 240 seeds, log10 s = 0.3, log10 q = -2.5): one production task on a real light curve.
+# About 2 minutes with the fast CPU build on an Apple M4 Pro.
+photometry tests/sample_ogle_blg1900.dat
+in mag 0.3 0.3 1 -2.5 -2.5 1 log10
+ncpus 1

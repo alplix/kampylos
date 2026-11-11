@@ -1,0 +1,5 @@
+# The whole planet cell (all 240 seeds): what one production task of this work unit computes. Long: about 9 minutes
+# with the fast CPU build and 8 to 18 minutes with the Metal app on an M1.
+photometry tests/regression/synthetic_planet.dat
+in flux 0.2 0.2 1 -3 -3 1 log10
+ncpus 1

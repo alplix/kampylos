@@ -1,0 +1,5 @@
+# The bundled OGLE light curve (448 points, magnitudes, tests/sample_ogle_blg1900.dat), cell log10 s = 0.3,
+# log10 q = -2.5, seeds k % 24 == 0.
+photometry tests/sample_ogle_blg1900.dat
+in mag 0.3 0.3 1 -2.5 -2.5 1 log10 part 0 24
+ncpus 1
