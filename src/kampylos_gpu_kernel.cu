@@ -108,13 +108,21 @@ extern "C" __global__ void kampylos_eval_candidates(
             continue; // whole candidate is dead regardless of n_bad/overflow -- see "poisoned" above
         }
         if (!kgpu::binary_mag2_fastpath_ok(r, rho)) {
-            int slot = atomicAdd(&bad_count, 1);
-            if (slot < KAMPYLOS_MAX_BAD_POINTS) {
-                results[cand_idx].bad_idx[slot] = i;
+            // 2026-11-22: the finite-source magnification of a disk that touches no caustic is
+            // computed here by quadrature (kgpu::finite_uniform_try); only caustic crossings and
+            // points where the quadrature does not converge go to the CPU contour integration.
+            double Af;
+            if (kgpu::finite_uniform_try(s, q, y1, y2, rho, A, r.corrquad2 * 256.0 * (rho * rho + 1.e-8), &Af)) {
+                A = Af;
             } else {
-                overflow_flag = 1;
+                int slot = atomicAdd(&bad_count, 1);
+                if (slot < KAMPYLOS_MAX_BAD_POINTS) {
+                    results[cand_idx].bad_idx[slot] = i;
+                } else {
+                    overflow_flag = 1;
+                }
+                continue; // excluded from this block's sums -- caller adds its real contribution
             }
-            continue; // excluded from this block's sums -- caller adds its real contribution
         }
 
         double sigma = data[i].sigma;

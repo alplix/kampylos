@@ -357,6 +357,81 @@ static inline int binary_mag2_fastpath_ok(const BinaryMag0Result* r, double rho,
     return (cq < Tol) && (cq2 < 1.0) && (r->safedist > 4.0 * rho2);
 }
 
+
+// ---------------------------------------------------------------------------------------------
+// Finite-source magnification of a uniform disk by quadrature of the point-source magnification
+// -- the OpenCL twin of kgpu::finite_uniform_try() in kampylos_gpu_mag.cuh (same nodes, same
+// acceptance tests; read the long comment there for the measurement and the reasons). Returns 1
+// and sets *out if the disk touches no caustic and the quadrature has converged, else 0 and the
+// point goes to the CPU contour integration as before.
+// ---------------------------------------------------------------------------------------------
+#define KGPU_FS_TOL 1.0e-4
+#define KGPU_FS_RHOMAX 0.06
+#define KGPU_FS_CQ2MAX 30.0
+#define KGPU_FS_MAXDEV 0.05
+static inline int finite_uniform_try(double s, double q, double y1, double y2, double rho, double A0, double cq2s, double* out) {
+    const double gx[4] = { 0.0694318442029737, 0.3300094782075719, 0.6699905217924281, 0.9305681557970263 };
+    const double gw[4] = { 0.1739274225687269, 0.3260725774312731, 0.3260725774312731, 0.1739274225687269 };
+    const int NA = 16;
+    const double two_pi = 6.283185307179586;
+    if (!(rho <= KGPU_FS_RHOMAX)) return 0;
+    if (!(cq2s < KGPU_FS_CQ2MAX)) return 0;   // see the CUDA twin: cusp clipping the disk
+    double y2a = (y2 < 0) ? -y2 : y2;
+    double sgn = (y2 < 0) ? -1.0 : 1.0;
+    int n_ref = -1;
+    double sumA = 0, sumB = 0;
+    for (int k = 0; k < NA; k++) {
+        double th = two_pi * (k + 0.25) / NA;
+        double yy2 = y2a + sgn * rho * sin(th);
+        BinaryMag0Result b = binary_mag0_gpu(s, q, y1 + rho * cos(th), yy2 < 0 ? -yy2 : yy2);
+        if (!(b.mag > 0) || !(b.mag < 1e300)) return 0;
+        if (n_ref < 0) n_ref = b.n_images; else if (b.n_images != n_ref) return 0;
+    }
+    for (int i = 0; i < 4; i++) {
+        double r = rho * sqrt(gx[i]);
+        double ringA = 0, ringB = 0;
+        for (int k = 0; k < NA; k++) {
+            double th = two_pi * (k + 0.5 * (i & 1) + 0.125) / NA;
+            double yy2 = y2a + sgn * r * sin(th);
+            BinaryMag0Result p = binary_mag0_gpu(s, q, y1 + r * cos(th), yy2 < 0 ? -yy2 : yy2);
+            if (!(p.mag > 0) || !(p.mag < 1e300)) return 0;
+            if (p.n_images != n_ref) return 0;
+            ringA += p.mag;
+            if ((k & 1) == 0) ringB += p.mag;
+        }
+        sumA += gw[i] * ringA / NA;
+        sumB += gw[i] * ringB / (NA / 2);
+    }
+    if (!(fabs(sumA - sumB) <= KGPU_FS_TOL * sumA)) return 0;
+    if (!(fabs(sumA - A0) <= KGPU_FS_MAXDEV * sumA)) return 0;
+    // Radial convergence check (added 2026-11-22 after tests/test_kampylos_gpu_kernel.cu found one
+    // candidate off by 0.9 % in chi2): where the finite-source effect is above 0.1 % the integrand
+    // varies enough across the disk (disk close to a fold) that the 4-node radial rule can be off
+    // by more than the angular test sees. A 6-node rule must then agree to KGPU_FS_TOL and replaces it.
+    if (fabs(sumA - A0) > 1.0e-3 * sumA) {
+        const double hx[6] = { 0.0337652428984240, 0.1693953067668678, 0.3806904069584016, 0.6193095930415985, 0.8306046932331322, 0.9662347571015760 };
+        const double hw[6] = { 0.0856622461895852, 0.1803807865240693, 0.2339569672863455, 0.2339569672863455, 0.1803807865240693, 0.0856622461895852 };
+        double sumC = 0;
+        for (int i = 0; i < 6; i++) {
+            double r = rho * sqrt(hx[i]);
+            double ring = 0;
+            for (int k = 0; k < NA; k++) {
+                double th = two_pi * (k + 0.5 * (i & 1) + 0.375) / NA;
+                double yy2 = y2a + sgn * r * sin(th);
+                BinaryMag0Result p = binary_mag0_gpu(s, q, y1 + r * cos(th), yy2 < 0 ? -yy2 : yy2);
+                if (!(p.mag > 0) || !(p.mag < 1e300)) return 0;
+                if (p.n_images != n_ref) return 0;
+                ring += p.mag;
+            }
+            sumC += hw[i] * ring / NA;
+        }
+        if (!(fabs(sumC - sumA) <= KGPU_FS_TOL * sumA)) return 0;
+        sumA = sumC;
+    }
+    *out = sumA;
+    return 1;
+}
+
 // ---------------------------------------------------------------------------------------------
 // The actual kernel. Mirrors kampylos_gpu_kernel.cu's kampylos_eval_candidates exactly -- one
 // OpenCL work-GROUP per candidate (matching one CUDA thread-BLOCK per candidate), work-items
@@ -429,13 +504,18 @@ __kernel void kampylos_eval_candidates(
             continue;
         }
         if (!binary_mag2_fastpath_ok(&r, rho, 1.e-2)) {
-            int slot = atomic_inc(bad_count);
-            if (slot < KAMPYLOS_CL_MAX_BAD_POINTS) {
-                results[cand_idx].bad_idx[slot] = i;
+            double Af;
+            if (finite_uniform_try(s, q, y1, y2, rho, A, r.corrquad2 * 256.0 * (rho * rho + 1.e-8), &Af)) {
+                A = Af;   // 2026-11-22: same as the CUDA kernel, only caustic crossings and non-converged points go to the CPU
             } else {
-                *overflow_flag = 1;
+                int slot = atomic_inc(bad_count);
+                if (slot < KAMPYLOS_CL_MAX_BAD_POINTS) {
+                    results[cand_idx].bad_idx[slot] = i;
+                } else {
+                    *overflow_flag = 1;
+                }
+                continue;
             }
-            continue;
         }
 
         double sigma = data[i].sigma;

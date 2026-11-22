@@ -476,4 +476,109 @@ KGPU_HD inline bool binary_mag2_fastpath_ok(const BinaryMag0Result& r, double rh
     return (cq < Tol) && (cq2 < 1.0) && (r.safedist > 4.0 * rho2);
 }
 
+
+// ---------------------------------------------------------------------------------------------
+// Finite-source magnification of a UNIFORM disk by quadrature of the point-source magnification,
+// for the common case that needs no contour integration: the disk does not touch a caustic.
+// 2026-11-22 measurement (planet cell, 7 M points that the quadrupole/hexadecapole test sent to
+// the CPU): 99.2 % had the same image count everywhere on the disk and a point-source error
+// below 5 %; true caustic crossings were 0.025 %. Those 99 % cost the CPU (VBMicrolensing
+// BinaryMagDark) 97 % of the run time while the GPU idled.
+//   A = (1 / (pi rho^2)) * integral over the disk of A_pt, written in polar coordinates with the
+//   area coordinate u = r^2: radial Gauss-Legendre in u (4 nodes), uniform angles (16 per ring,
+//   rings staggered by half a step). The error is estimated by dropping every other angle; the
+//   result is accepted only if (a) every node has the same number of images as the disk boundary
+//   (no caustic crossing), (b) all point-source values are finite and positive, and (c) the
+//   two angular rules agree to KGPU_FS_TOL (relative). Otherwise returns false and the caller
+//   sends the point to the CPU contour integration as before.
+// ---------------------------------------------------------------------------------------------
+#ifndef KGPU_FS_TOL
+#define KGPU_FS_TOL 1.0e-4
+#endif
+#ifndef KGPU_FS_RHOMAX
+#define KGPU_FS_RHOMAX 0.06
+#endif
+#ifndef KGPU_FS_CQ2MAX
+#define KGPU_FS_CQ2MAX 30.0
+#endif
+#ifndef KGPU_FS_MAXDEV
+#define KGPU_FS_MAXDEV 0.05
+#endif
+KGPU_HD inline bool finite_uniform_try(double s, double q, double y1, double y2, double rho, double A0, double cq2s, double* out) {
+    // Gauss-Legendre nodes/weights on [0,1] for 4 points
+    const double gx[4] = { 0.0694318442029737, 0.3300094782075719, 0.6699905217924281, 0.9305681557970263 };
+    const double gw[4] = { 0.1739274225687269, 0.3260725774312731, 0.3260725774312731, 0.1739274225687269 };
+    const int NA = 16;
+    const double two_pi = 6.283185307179586;
+    // A source larger than this can swallow a whole planetary caustic between the sample nodes (seen
+    // 2026-11-22: q = 2e-4, rho = 0.069 and q = 0.7, rho = 0.09 gave 1.7e-3 and 6.4e-3 errors with a
+    // constant image count at every node): the CPU contour integration keeps those.
+    if (!(rho <= KGPU_FS_RHOMAX)) return false;
+    // cq2s = BinaryMag2's scaled hexadecapole error indicator (corrquad2 * 256 * (rho^2 + 1e-8); the fast path
+    // needs it below 1). A stress test near the resonant caustic (tests/test_kampylos_finite_uniform.cpp
+    // "resonant", 2026-11-22) showed the image count and the quadrature checks alone miss a cusp that only
+    // clips the disk: accepted points with cq2s < 30 were all within 1e-4 of a tight reference, those with
+    // 30 <= cq2s < 1e4 were off by up to 6 %. The latter stay on the CPU contour integration.
+    if (!(cq2s < KGPU_FS_CQ2MAX)) return false;
+    double y2a = (y2 < 0) ? -y2 : y2;   // symmetric lens: |y2|, the same mirror BinaryMag2 uses
+    double sgn = (y2 < 0) ? -1.0 : 1.0;
+    int n_ref = -1;
+    double sumA = 0, sumB = 0;          // all NA angles / every other angle
+    // boundary ring first: fixes the image count that every interior node must share
+    for (int k = 0; k < NA; k++) {
+        double th = two_pi * (k + 0.25) / NA;
+        double yy2 = y2a + sgn * rho * sin(th);
+        BinaryMag0Result b = binary_mag0_gpu(s, q, y1 + rho * cos(th), yy2 < 0 ? -yy2 : yy2);
+        if (!(b.mag > 0) || !(b.mag < 1e300)) return false;
+        if (n_ref < 0) n_ref = b.n_images; else if (b.n_images != n_ref) return false;
+    }
+    for (int i = 0; i < 4; i++) {
+        double r = rho * sqrt(gx[i]);
+        double ringA = 0, ringB = 0;
+        for (int k = 0; k < NA; k++) {
+            double th = two_pi * (k + 0.5 * (i & 1) + 0.125) / NA;
+            double yy2 = y2a + sgn * r * sin(th);
+            BinaryMag0Result p = binary_mag0_gpu(s, q, y1 + r * cos(th), yy2 < 0 ? -yy2 : yy2);
+            if (!(p.mag > 0) || !(p.mag < 1e300)) return false;
+            if (p.n_images != n_ref) return false;
+            ringA += p.mag;
+            if ((k & 1) == 0) ringB += p.mag;
+        }
+        sumA += gw[i] * ringA / NA;
+        sumB += gw[i] * ringB / (NA / 2);
+    }
+    if (!(fabs(sumA - sumB) <= KGPU_FS_TOL * sumA)) return false;
+    // A0 = the point-source magnification at the disk centre. A finite-source effect above 5 %
+    // means the disk sits close to a caustic (cusp or fold) where the integrand varies fast and
+    // the quadrature error can reach percent level although the image count is constant: those
+    // points (0.8 % of the CPU-bound ones in the 2026-11-22 measurement) stay on the CPU contour integration.
+    if (!(fabs(sumA - A0) <= KGPU_FS_MAXDEV * sumA)) return false;
+    // Radial convergence check (added 2026-11-22 after tests/test_kampylos_gpu_kernel.cu found one
+    // candidate off by 0.9 % in chi2): where the finite-source effect is above 0.1 % the integrand
+    // varies enough across the disk (disk close to a fold) that the 4-node radial rule can be off
+    // by more than the angular test sees. A 6-node rule must then agree to KGPU_FS_TOL and replaces it.
+    if (fabs(sumA - A0) > 1.0e-3 * sumA) {
+        const double hx[6] = { 0.0337652428984240, 0.1693953067668678, 0.3806904069584016, 0.6193095930415985, 0.8306046932331322, 0.9662347571015760 };
+        const double hw[6] = { 0.0856622461895852, 0.1803807865240693, 0.2339569672863455, 0.2339569672863455, 0.1803807865240693, 0.0856622461895852 };
+        double sumC = 0;
+        for (int i = 0; i < 6; i++) {
+            double r = rho * sqrt(hx[i]);
+            double ring = 0;
+            for (int k = 0; k < NA; k++) {
+                double th = two_pi * (k + 0.5 * (i & 1) + 0.375) / NA;
+                double yy2 = y2a + sgn * r * sin(th);
+                BinaryMag0Result p = binary_mag0_gpu(s, q, y1 + r * cos(th), yy2 < 0 ? -yy2 : yy2);
+                if (!(p.mag > 0) || !(p.mag < 1e300)) return false;
+                if (p.n_images != n_ref) return false;
+                ring += p.mag;
+            }
+            sumC += hw[i] * ring / NA;
+        }
+        if (!(fabs(sumC - sumA) <= KGPU_FS_TOL * sumA)) return false;
+        sumA = sumC;
+    }
+    *out = sumA;
+    return true;
+}
+
 } // namespace kgpu

@@ -48,6 +48,12 @@ is the BOINC library's reaction to it, not a crash.
 | `vendor/VBMicrolensing` | submodule, third-party: `alplix/VBMicrolensing` branch `thread-safe-statics` (v5.6 with `thread_local` statics, defines `VBM_THREAD_SAFE`); do not edit |
 | `vendor/patch_vbm_thread_local.py` | makes plain upstream v5.6 equivalent to the fork, `--strip`s the fork back to upstream (CPU build), or rewrites it with one thread_local block per function (`--block`, GPU builds); `--reset` (warm-start methods for `KAMPYLOS_RESET_STATE`) and `--pool` (free lists for the small classes) add to any form |
 
+**Finite-source points on the GPU (2026-11-22).** CUDA and OpenCL integrate the finite-source magnification of a uniform
+disk by quadrature on the GPU when it touches no caustic (`kgpu::finite_uniform_try`, gates and checks in
+`docs/BENCHMARK.md`, "Finite-source quadrature on the GPU"); only caustic crossings and non-converged points reach
+VBMicrolensing on the CPU. Metal still sends every such point to the CPU. Results differ from the all-CPU app at the
+1e-4 level in the magnification of those points, well inside VBMicrolensing's own Tol of 1e-2.
+
 ## Invariants (break one and results become silently wrong)
 
 - **Natural logs inside, grid units outside.** Every `log_s`/`log_q` passed to a fit function is a natural log.

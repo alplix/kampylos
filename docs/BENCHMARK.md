@@ -737,3 +737,38 @@ not speed results: they show that each build compiles, links, runs to the end an
 * **BOINC priority**: the client runs apps at low priority. On Apple Silicon a process with background QoS runs on the
   efficiency cores only, a niced one need not; which one a volunteer's Mac gives the app depends on how the client
   lowers the priority. Compare `RUN_PREFIX="taskpolicy -b"` and `RUN_PREFIX="nice -n 19"` before trusting a gain.
+
+## Finite-source quadrature on the GPU (CUDA, OpenCL), 2026-11-22
+
+**Why.** On a caustic-free cell the GPU apps ran at 2-8 % GPU utilisation: of the points the quadrupole/hexadecapole test
+sends to the CPU (7 M in a 100 s window of the planet cell, RTX 5070 Ti, 4 completion threads) 99.2 % had the same image
+count everywhere on the source disk and a point-source error below 5 %; true caustic crossings were 0.025 % of them.
+Those points cost the CPU contour integration (`BinaryMagDark`) 97 % of the run time.
+
+**What.** `kgpu::finite_uniform_try()` (`src/kampylos_gpu_mag.cuh`, OpenCL twin in `src/kampylos_kernel.cl`) integrates the
+point-source magnification over the uniform disk: 4 radial Gauss-Legendre nodes in r^2 times 16 angles, a 16-point
+boundary ring that fixes the image count. It accepts a point only if every node has that image count, all
+magnifications are finite and positive, the rule agrees with its every-other-angle version to 1e-4, rho <= 0.06, the
+hexadecapole indicator `cq2s` < 30, the finite-source effect is below 5 %, and, where it exceeds 0.1 %, a 6-node radial
+rule agrees to 1e-4. Everything else stays on the CPU as before. The kernel adds the accepted magnification to its
+sums; the rest of the pipeline (bad-point list, completion, checkpoints, result format) is unchanged.
+
+**How it was checked** (`tests/test_kampylos_finite_uniform.cpp`, plain g++, no GPU): against VBMicrolensing with
+Tol = 1e-6, random (s, q, rho, y): 58 % of the points the fast path rejects are accepted, worst error 2.9e-5; stress mode
+`resonant` (s 0.7-1.5, q 0.01-1, source within 0.5 of the axis): 79 % accepted, worst error 1.0e-4. VBMicrolensing's own
+default (Tol = 1e-2) is off by up to 2e-3 against the same reference, so the GPU number is the better one.
+`tests/test_kampylos_gpu_kernel.cu` (2001 candidates against a tight reference): worst chi2 error 6e-4, no mismatch
+above 2e-3 (its reference now uses Tol = 1e-6; with the default Tol the reference's own error showed up as a "mismatch").
+Two things the first versions got wrong and the tests found: an 8-angle boundary ring and a cheap 32-node first rule
+accepted points where a cusp or fold clipped the disk (errors of 5 % and 20 %), and without the `cq2s` gate a cusp that
+only clips the disk went unseen (up to 6 %). Do not loosen these gates without running the `resonant` mode.
+
+**Speed** (RTX 5070 Ti, CUDA, one completion thread as under the plan class's avg_ncpus 1.0; same chi2 on the planet cell,
+OGLE cell 2812.21 against 2811.67): planet cell 474.8 s -> 176.9 s, OGLE `sample_ogle_blg1900` 101.5 s -> 64.1 s. GPU
+utilisation on the planet cell rose from 2.8 % to about 60 %. With 4 completion threads the old app wins the wall clock on
+the OGLE cell (38.9 s against 60.5 s) because the GPU is now the longer part, at 40 % less CPU time.
+OpenCL (NVIDIA ICD) behaves the same: planet 161.9 s / 510 CPU s -> 157.6 s / 205 CPU s with 4 threads.
+
+**Metal is not changed.** The same method in float (positions and ring sums) with the double-single magnifications made
+`tests/test_metal_fit.mm` fail (mean |dchi2| 0.375 against the 0.05 limit, worst 23.7; the unchanged app: 0.008 and
+0.085). Apple GPUs have no FP64, so the quadrature would need double-single sums and positions as well; not done.
